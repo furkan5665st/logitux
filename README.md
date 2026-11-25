@@ -42,7 +42,7 @@ Run `LogiTux-Portable-Windows-x64.exe`. No installation required.
 - LIGHTSYNC presets, per-zone colors and animations
 - Button assignments: shortcuts, keys, media, macros, Discord and OBS actions
 - Profiles and onboard memory
-- Turkish and English interface
+- Multi-language interface
 
 ## Build
 

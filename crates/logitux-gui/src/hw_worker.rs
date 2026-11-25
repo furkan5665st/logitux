@@ -1,10 +1,11 @@
 use std::fs;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use logitux_hidpp::{
+    HidppError,
     features::{
         onboard::{OnboardMode, OnboardProfile},
         perkey::ZoneColor,
@@ -12,7 +13,7 @@ use logitux_hidpp::{
     },
     DeviceSummary, FeatureId,
 };
-use logitux_transport::{connect_all_devices, ConnectedDevice};
+use logitux_transport::{connect_all_devices, enumerate_logitech_devices, ConnectedDevice};
 
 use crate::store::{MouseCmd, ProfileConfig, RichAssignment};
 
@@ -147,7 +148,20 @@ fn run_worker_loop(
         &ctx,
     );
 
+    let mut last_presence = presence_signature();
+    let mut last_presence_check = Instant::now();
+
     loop {
+        let mut rescan_requested = false;
+        if last_presence_check.elapsed() >= Duration::from_millis(900) {
+            last_presence_check = Instant::now();
+            let signature = presence_signature();
+            if signature != last_presence {
+                last_presence = signature;
+                rescan_requested = true;
+            }
+        }
+
         let mut pending_cmds = Vec::new();
         while let Ok(c) = cmd_rx.try_recv() {
             pending_cmds.push(c);
@@ -250,6 +264,9 @@ fn run_worker_loop(
                 HwCommand::SetDpi(dpi) => {
                     if let Some(m) = devices.get(selected_idx) {
                         if let Err(e) = m.connected.device.set_dpi(0, dpi) {
+                            if is_connection_error(&e) {
+                                rescan_requested = true;
+                            }
                             let _ = evt_tx.send(HwEvent::Toast {
                                 msg: format!("DPI hatası: {e}"),
                                 is_err: true,
@@ -275,6 +292,9 @@ fn run_worker_loop(
                                 ctx.request_repaint();
                             }
                             Err(e) => {
+                                if is_connection_error(&e) {
+                                    rescan_requested = true;
+                                }
                                 let _ = evt_tx.send(HwEvent::Toast {
                                     msg: format!("Bildirme hızı hatası: {e}"),
                                     is_err: true,
@@ -303,6 +323,9 @@ fn run_worker_loop(
                                 );
                             }
                             Err(e) => {
+                                if is_connection_error(&e) {
+                                    rescan_requested = true;
+                                }
                                 let _ = evt_tx.send(HwEvent::Toast {
                                     msg: format!("LIGHTSYNC hatası: {e}"),
                                     is_err: true,
@@ -328,16 +351,23 @@ fn run_worker_loop(
                         },
                     ];
                     if let Some(m) = devices.get_mut(selected_idx) {
-                        if m.connected.device.set_perkey_zones(&zones, persist).is_ok() {
-                            onboard_mode = OnboardMode::Host;
-                            let _ = evt_tx.send(HwEvent::OnboardModeChanged(OnboardMode::Host));
-                            sync_spy(
-                                &devices,
-                                selected_idx,
-                                onboard_mode,
-                                &current_button_map,
-                                &mut spy_enabled,
-                            );
+                        match m.connected.device.set_perkey_zones(&zones, persist) {
+                            Ok(()) => {
+                                onboard_mode = OnboardMode::Host;
+                                let _ =
+                                    evt_tx.send(HwEvent::OnboardModeChanged(OnboardMode::Host));
+                                sync_spy(
+                                    &devices,
+                                    selected_idx,
+                                    onboard_mode,
+                                    &current_button_map,
+                                    &mut spy_enabled,
+                                );
+                            }
+                            Err(e) if is_connection_error(&e) => {
+                                rescan_requested = true;
+                            }
+                            Err(_) => {}
                         }
                     }
                 }
@@ -351,6 +381,9 @@ fn run_worker_loop(
                                 ctx.request_repaint();
                             }
                             Err(e) => {
+                                if is_connection_error(&e) {
+                                    rescan_requested = true;
+                                }
                                 let _ = evt_tx.send(HwEvent::Toast {
                                     msg: format!("Başlatma efekti hatası: {e}"),
                                     is_err: true,
@@ -418,6 +451,22 @@ fn run_worker_loop(
             break;
         }
 
+        if rescan_requested {
+            scan_into(
+                &mut devices,
+                &mut selected_idx,
+                &mut onboard_mode,
+                &mut spy_enabled,
+                &current_button_map,
+                None,
+                &evt_tx,
+                &ctx,
+            );
+            last_mask = 0;
+            last_presence = presence_signature();
+            last_presence_check = Instant::now();
+        }
+
         if spy_enabled {
             if let Some(m) = devices.get(selected_idx) {
                 match m.connected.device.poll_button_spy_event(6) {
@@ -436,6 +485,29 @@ fn run_worker_loop(
             }
         }
     }
+}
+
+fn is_connection_error(err: &HidppError) -> bool {
+    matches!(err, HidppError::Timeout | HidppError::Transport(_))
+}
+
+fn presence_signature() -> Vec<(u16, u16, String, i32)> {
+    let mut signature: Vec<(u16, u16, String, i32)> = enumerate_logitech_devices()
+        .map(|list| {
+            list.into_iter()
+                .map(|d| {
+                    (
+                        d.vendor_id,
+                        d.product_id,
+                        d.serial_number,
+                        d.interface_number,
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    signature.sort();
+    signature
 }
 
 fn cleanup_all_devices(devices: &[WorkerMouse]) {
@@ -481,14 +553,28 @@ fn scan_into(
     }
 
     if !devices.is_empty() {
-        *selected_idx = 0;
-        *onboard_mode = devices[0].summary.onboard_mode.unwrap_or(OnboardMode::Host);
+        *selected_idx = (*selected_idx).min(devices.len() - 1);
+        *onboard_mode = devices[*selected_idx]
+            .summary
+            .onboard_mode
+            .unwrap_or(OnboardMode::Host);
         if *onboard_mode != OnboardMode::Onboard {
             if let Some(eff) = initial_effect {
-                let _ = devices[0].connected.device.set_rgb_effect(0, eff, false);
+                let _ = devices[*selected_idx]
+                    .connected
+                    .device
+                    .set_rgb_effect(0, eff, false);
             }
         }
-        sync_spy(devices, 0, *onboard_mode, current_button_map, spy_enabled);
+        sync_spy(
+            devices,
+            *selected_idx,
+            *onboard_mode,
+            current_button_map,
+            spy_enabled,
+        );
+    } else {
+        *selected_idx = 0;
     }
 
     let snaps: Vec<DeviceUiSnapshot> = devices

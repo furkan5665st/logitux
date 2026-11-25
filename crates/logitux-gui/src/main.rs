@@ -4,6 +4,7 @@ mod app;
 mod canvas;
 mod hw_worker;
 mod i18n;
+mod i18n_data;
 mod icons;
 mod input_synth;
 mod integrations;

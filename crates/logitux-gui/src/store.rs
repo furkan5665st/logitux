@@ -636,7 +636,7 @@ pub struct AppStore {
 impl Default for AppStore {
     fn default() -> Self {
         Self {
-            lang: Lang::Tr,
+            lang: Lang::default(),
             home_grid_mode: true,
             dynamic_lighting: false,
             auto_profile_switching: false,

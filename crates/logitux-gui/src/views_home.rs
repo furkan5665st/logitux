@@ -35,7 +35,7 @@ pub fn render_profiles_page(
 
     ui.add_space(16.0);
     ui.horizontal_top(|ui| {
-        ui.allocate_ui(Vec2::new(225.0, ui.available_height()), |ui| {
+        ui.allocate_ui(Vec2::new(225.0, 0.0), |ui| {
             let total = store.apps.len();
             for (f, lbl, count_opt) in [
                 (ProfileFilter::All, lang.pick("Tümü", "All"), Some(total)),
@@ -83,8 +83,7 @@ pub fn render_profiles_page(
                 }
             }
 
-            let bottom_space = (ui.available_height() - 125.0).max(24.0);
-            ui.add_space(bottom_space);
+            ui.add_space(32.0);
 
             ui.label(
                 RichText::new(lang.pick("Profil Değiştirme  ⓘ", "Profile Switching  ⓘ"))
@@ -143,7 +142,7 @@ pub fn render_profiles_page(
         ui.add_space(20.0);
 
         ui.vertical(|ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.vertical(|ui| {
                     ui.label(
                         RichText::new(lang.pick(
@@ -166,7 +165,7 @@ pub fn render_profiles_page(
                     );
                 });
 
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.add_space(16.0);
                     if ui
                         .add(

@@ -377,6 +377,28 @@ impl LogiTuxApp {
         self.hw.send(HwCommand::SetReportRate(hz));
     }
 
+    fn resync_hardware_settings(&mut self) {
+        self.hw.send(HwCommand::SetDpi(self.live_dpi));
+        let rate = self.store.active_profile().report_rate_hz;
+        if rate > 0 {
+            self.hw.send(HwCommand::SetReportRate(rate));
+        }
+        self.sync_button_map_to_hw();
+        if self.lightsync_enabled {
+            if self.rgb_tab == LightsyncSubTab::Freestyle {
+                let colors = self.perkey_colors;
+                self.apply_perkey_rgb(colors, false);
+            } else {
+                self.apply_rgb_preset(false);
+            }
+        } else {
+            self.hw.send(HwCommand::SetRgbPreset {
+                effect: RgbEffect::Off,
+                persist: false,
+            });
+        }
+    }
+
     fn current_rgb_effect(&self) -> RgbEffect {
         if !self.lightsync_enabled {
             return RgbEffect::Off;
@@ -743,10 +765,19 @@ impl eframe::App for LogiTuxApp {
         while let Ok(ev) = self.hw.rx.try_recv() {
             match ev {
                 HwEvent::DevicesUpdated(snaps) => {
+                    let was_empty = self.devices.is_empty();
                     self.devices = snaps;
-                    if !self.devices.is_empty() {
+                    if self.devices.is_empty() {
+                        self.selected_idx = 0;
+                        self.screen = RootScreen::HomeDevices;
+                        self.pressed_mask = 0;
+                        self.onboard_mode = OnboardMode::Host;
+                    } else {
                         self.selected_idx = self.selected_idx.min(self.devices.len() - 1);
                         self.sync_from_hardware();
+                        if was_empty {
+                            self.resync_hardware_settings();
+                        }
                     }
                 }
                 HwEvent::ButtonMask(mask) => {
@@ -893,17 +924,21 @@ impl eframe::App for LogiTuxApp {
                             .inner_margin(egui::Margin::symmetric(22, 8)),
                     )
                     .show(ctx, |ui| {
-                        if let Some(pid) = views_home::render_profiles_page(
-                            ui,
-                            &mut self.store,
-                            &mut self.prof_filter,
-                            &mut self.prof_search,
-                            &mut self.adding_app_modal,
-                            &mut self.new_app_name,
-                            &mut self.new_app_exe,
-                        ) {
-                            self.activate_profile_by_id(&pid);
-                        }
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                if let Some(pid) = views_home::render_profiles_page(
+                                    ui,
+                                    &mut self.store,
+                                    &mut self.prof_filter,
+                                    &mut self.prof_search,
+                                    &mut self.adding_app_modal,
+                                    &mut self.new_app_name,
+                                    &mut self.new_app_exe,
+                                ) {
+                                    self.activate_profile_by_id(&pid);
+                                }
+                            });
                     });
             }
             RootScreen::DeviceStudio => {
@@ -2600,15 +2635,15 @@ impl LogiTuxApp {
                     if !self.lightsync_enabled {
                         self.hw.send(HwCommand::SetRgbPreset {
                             effect: RgbEffect::Off,
-                            persist: true,
+                            persist: false,
                         });
                     } else if self.rgb_tab == LightsyncSubTab::Freestyle {
-                        self.apply_perkey_rgb(self.perkey_colors, true);
+                        self.apply_perkey_rgb(self.perkey_colors, false);
                     } else {
                         if self.preset_kind == PresetKind::Off {
                             self.preset_kind = PresetKind::ColorWave;
                         }
-                        self.apply_rgb_preset(true);
+                        self.apply_rgb_preset(false);
                     }
                 }
             });
@@ -3029,13 +3064,21 @@ impl LogiTuxApp {
                     ui.set_min_width(360.0);
                     ui.horizontal(|ui| {
                         ui.label(lang.pick("Dil / Language:", "Language:"));
-                        if ui
-                            .selectable_value(&mut self.store.lang, Lang::Tr, "Türkçe")
-                            .clicked()
-                            || ui
-                                .selectable_value(&mut self.store.lang, Lang::En, "English")
-                                .clicked()
-                        {
+                        let mut selected = self.store.lang;
+                        egui::ComboBox::from_id_salt("logitux_language_combo")
+                            .selected_text(selected.native_name())
+                            .width(220.0)
+                            .show_ui(ui, |ui| {
+                                for candidate in Lang::all() {
+                                    ui.selectable_value(
+                                        &mut selected,
+                                        *candidate,
+                                        candidate.native_name(),
+                                    );
+                                }
+                            });
+                        if selected != self.store.lang {
+                            self.store.lang = selected;
                             self.store.save();
                         }
                     });
