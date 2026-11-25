@@ -1,0 +1,18 @@
+[package]
+name = "logitux-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LogiTux command line tool"
+
+[[bin]]
+name = "logitux"
+path = "src/main.rs"
+
+[dependencies]
+logitux-hidpp.workspace = true
+logitux-transport.workspace = true
+logitux-devices.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,12 @@
+/target
+/dist
+/AppDir
+/deb_pkg
+/rpmbuild
+**/*.rs.bk
+*.pdb
+*.exe
+*.AppImage
+.DS_Store
+Thumbs.db
+backups/

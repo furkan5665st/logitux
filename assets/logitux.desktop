@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=LogiTux
+Comment=Logitech mouse configuration
+Exec=logitux-gui
+Icon=logitux
+Terminal=false
+Type=Application
+Categories=Utility;Settings;HardwareSettings;
+Keywords=Logitech;Mouse;DPI;RGB;LIGHTSYNC;HID++;
+StartupNotify=true

@@ -1,0 +1,47 @@
+name: Release Packages
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux-packages:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux build & packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libudev-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxi-dev \
+            libxcursor-dev \
+            libxrandr-dev \
+            libgl1-mesa-dev \
+            pkg-config \
+            rpm \
+            file \
+            fuse \
+            libfuse2 \
+            wget
+
+      - name: Build AppImage, DEB, RPM, and Universal Linux Tarball
+        run: |
+          sed -i 's/\r$//' packaging/linux/build-packages.sh packaging/linux/install-bin.sh
+          bash packaging/linux/build-packages.sh
+
+      - name: Upload Linux Packages Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: logitux-linux-packages
+          path: dist/*

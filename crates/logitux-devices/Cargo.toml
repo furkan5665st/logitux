@@ -1,0 +1,9 @@
+[package]
+name = "logitux-devices"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Logitech mouse and receiver database"
+
+[dependencies]
+serde.workspace = true

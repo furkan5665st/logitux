@@ -1,0 +1,10 @@
+[package]
+name = "logitux-hidpp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "HID++ protocol library for Logitech mice"
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true

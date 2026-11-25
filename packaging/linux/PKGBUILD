@@ -1,0 +1,23 @@
+pkgname=logitux
+pkgver=0.3.1
+pkgrel=1
+pkgdesc="Fast native Rust G HUB-style studio & CLI for Logitech mice (HID++ 2.0)"
+arch=('x86_64')
+url="https://github.com/furkan5665st/logitux"
+license=('MIT' 'Apache-2.0')
+depends=('systemd-libs' 'libxkbcommon' 'wayland' 'libx11' 'libglvnd')
+makedepends=('cargo' 'pkgconf')
+source=()
+
+build() {
+  cd "$startdir/../.."
+  cargo build --release --locked --workspace
+}
+
+package() {
+  cd "$startdir/../.."
+  install -Dm755 target/release/logitux-gui "$pkgdir/usr/bin/logitux-gui"
+  install -Dm755 target/release/logitux "$pkgdir/usr/bin/logitux"
+  install -Dm644 udev/99-logitux.rules "$pkgdir/usr/lib/udev/rules.d/99-logitux.rules"
+  install -Dm644 assets/logitux.desktop "$pkgdir/usr/share/applications/logitux.desktop"
+}

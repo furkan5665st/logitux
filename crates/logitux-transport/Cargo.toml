@@ -1,0 +1,17 @@
+[package]
+name = "logitux-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "HID++ transport for Linux and Windows"
+
+[dependencies]
+logitux-hidpp.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+hidapi = { version = "2.6", default-features = false, features = ["linux-native"] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+hidapi = { version = "2.6" }
