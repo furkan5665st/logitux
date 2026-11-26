@@ -867,6 +867,38 @@ impl<T: Transport> HidppDevice<T> {
         Ok(())
     }
 
+    pub fn write_onboard_raw_sector(&self, sector_id: u16, data: &[u8]) -> Result<()> {
+        if sector_id < 2 {
+            return Err(HidppError::InvalidArgument(
+                "Refusing to write raw macro data into directory or primary profile sector".into(),
+            ));
+        }
+        if data.len() < 16 {
+            return Err(HidppError::InvalidArgument(format!(
+                "Sector data too short: {} bytes",
+                data.len()
+            )));
+        }
+        let [s_hi, s_lo] = sector_id.to_be_bytes();
+        let [c_hi, c_lo] = (data.len() as u16).to_be_bytes();
+        self.request_feature(
+            FeatureId::ONBOARD_PROFILES,
+            6,
+            &[s_hi, s_lo, 0x00, 0x00, c_hi, c_lo],
+        )?;
+        for chunk in data.chunks(16) {
+            if chunk.len() == 16 {
+                self.request_feature(FeatureId::ONBOARD_PROFILES, 7, chunk)?;
+            } else {
+                let mut padded = [0xFFu8; 16];
+                padded[..chunk.len()].copy_from_slice(chunk);
+                self.request_feature(FeatureId::ONBOARD_PROFILES, 7, &padded)?;
+            }
+        }
+        self.request_feature(FeatureId::ONBOARD_PROFILES, 8, &[])?;
+        Ok(())
+    }
+
     pub fn read_onboard_directory(&self) -> Result<Vec<ProfileDirectoryEntry>> {
         let desc = self.get_onboard_description()?;
         let sec0 = self.read_onboard_sector(0, desc.sector_size)?;

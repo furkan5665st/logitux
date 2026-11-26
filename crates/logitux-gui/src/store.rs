@@ -2,7 +2,7 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-use logitux_hidpp::features::onboard::ButtonAction;
+use logitux_hidpp::features::onboard::{ButtonAction, OnboardMacroOp};
 use serde::{Deserialize, Serialize};
 
 use crate::i18n::Lang;
@@ -345,7 +345,7 @@ impl RichAssignment {
         matches!(self, Self::Mouse(m) if m.is_dpi_related())
     }
 
-    pub fn to_onboard(&self) -> ButtonAction {
+    pub fn to_onboard_with_discord(&self, discord: &DiscordSettings) -> ButtonAction {
         match self {
             Self::Mouse(MouseCmd::PrimaryClick) => ButtonAction::MouseButton(0x0001),
             Self::Mouse(MouseCmd::SecondaryClick) => ButtonAction::MouseButton(0x0002),
@@ -359,25 +359,13 @@ impl RichAssignment {
             Self::Mouse(MouseCmd::DpiCycle) => ButtonAction::Special(0x05),
             Self::Mouse(MouseCmd::DefaultDpi) => ButtonAction::Special(0x06),
             Self::Mouse(MouseCmd::DpiShift | MouseCmd::GoToDpiShift) => ButtonAction::Special(0x07),
-            Self::Mouse(MouseCmd::OnboardProfileCycle) => ButtonAction::Special(0x08),
-            Self::Mouse(MouseCmd::GShift) => ButtonAction::Special(0x0A),
+            Self::Mouse(MouseCmd::OnboardProfileCycle) => ButtonAction::Special(0x0A),
+            Self::Mouse(MouseCmd::GShift) => ButtonAction::Special(0x0B),
+            Self::Mouse(MouseCmd::ScrollDown) => ButtonAction::Special(0x10),
+            Self::Mouse(MouseCmd::ScrollUp) => ButtonAction::Special(0x11),
             Self::Mouse(MouseCmd::Disabled) => ButtonAction::Disabled,
-            Self::Mouse(_) => ButtonAction::Inherit,
-            Self::Media(MediaCmd::PlayPause) => ButtonAction::ConsumerKey(0x00CD),
-            Self::Media(MediaCmd::Stop) => ButtonAction::ConsumerKey(0x00B7),
-            Self::Media(MediaCmd::NextTrack) => ButtonAction::ConsumerKey(0x00B5),
-            Self::Media(MediaCmd::PrevTrack) => ButtonAction::ConsumerKey(0x00B6),
-            Self::Media(MediaCmd::VolumeUp) => ButtonAction::ConsumerKey(0x00E9),
-            Self::Media(MediaCmd::VolumeDown) => ButtonAction::ConsumerKey(0x00EA),
-            Self::Media(MediaCmd::Mute) => ButtonAction::ConsumerKey(0x00E2),
-            Self::Media(MediaCmd::Calculator) => ButtonAction::ConsumerKey(0x0192),
-            Self::Media(MediaCmd::BrowserHome) => ButtonAction::ConsumerKey(0x0223),
-            Self::Media(MediaCmd::Mail) => ButtonAction::ConsumerKey(0x018A),
-            Self::Media(MediaCmd::Search) => ButtonAction::ConsumerKey(0x0221),
-            Self::Media(MediaCmd::Screenshot) => ButtonAction::Keyboard {
-                modifiers: 0x00,
-                key: 0x46,
-            },
+            Self::Mouse(MouseCmd::DoubleClick) => ButtonAction::MouseButton(0x0001),
+            Self::Media(m) => media_cmd_to_onboard(*m),
             Self::Command {
                 modifiers, hid_key, ..
             }
@@ -385,11 +373,43 @@ impl RichAssignment {
                 modifiers: *modifiers,
                 key: *hid_key,
             },
+            Self::Action(IntegrationAction::Discord(DiscordAction::ToggleMute)) => {
+                ButtonAction::Keyboard {
+                    modifiers: discord.mute_shortcut.0,
+                    key: discord.mute_shortcut.1,
+                }
+            }
+            Self::Action(IntegrationAction::Discord(DiscordAction::ToggleDeafen)) => {
+                ButtonAction::Keyboard {
+                    modifiers: discord.deafen_shortcut.0,
+                    key: discord.deafen_shortcut.1,
+                }
+            }
+            Self::Action(IntegrationAction::Discord(DiscordAction::PushToTalk)) => {
+                ButtonAction::Keyboard {
+                    modifiers: discord.ptt_shortcut.0,
+                    key: discord.ptt_shortcut.1,
+                }
+            }
             Self::Action(_) | Self::Macro { .. } => ButtonAction::Inherit,
         }
     }
 
-    #[allow(dead_code)]
+    pub fn is_host_only(&self) -> bool {
+        matches!(
+            self,
+            Self::Action(
+                IntegrationAction::Obs(_)
+                    | IntegrationAction::Slobs(_)
+                    | IntegrationAction::Overwolf { .. }
+                    | IntegrationAction::Custom(_)
+                    | IntegrationAction::Discord(
+                        DiscordAction::JoinVoice { .. } | DiscordAction::LeaveVoice
+                    )
+            )
+        )
+    }
+
     pub fn from_onboard(act: ButtonAction) -> Self {
         match act {
             ButtonAction::Disabled => Self::Mouse(MouseCmd::Disabled),
@@ -405,8 +425,10 @@ impl RichAssignment {
             ButtonAction::Special(0x05) => Self::Mouse(MouseCmd::DpiCycle),
             ButtonAction::Special(0x06) => Self::Mouse(MouseCmd::DefaultDpi),
             ButtonAction::Special(0x07) => Self::Mouse(MouseCmd::DpiShift),
-            ButtonAction::Special(0x08) => Self::Mouse(MouseCmd::OnboardProfileCycle),
-            ButtonAction::Special(0x0A) => Self::Mouse(MouseCmd::GShift),
+            ButtonAction::Special(0x08 | 0x09 | 0x0A) => Self::Mouse(MouseCmd::OnboardProfileCycle),
+            ButtonAction::Special(0x0B) => Self::Mouse(MouseCmd::GShift),
+            ButtonAction::Special(0x10) => Self::Mouse(MouseCmd::ScrollDown),
+            ButtonAction::Special(0x11) => Self::Mouse(MouseCmd::ScrollUp),
             ButtonAction::ConsumerKey(0x00CD) => Self::Media(MediaCmd::PlayPause),
             ButtonAction::ConsumerKey(0x00B7) => Self::Media(MediaCmd::Stop),
             ButtonAction::ConsumerKey(0x00B5) => Self::Media(MediaCmd::NextTrack),
@@ -414,12 +436,260 @@ impl RichAssignment {
             ButtonAction::ConsumerKey(0x00E9) => Self::Media(MediaCmd::VolumeUp),
             ButtonAction::ConsumerKey(0x00EA) => Self::Media(MediaCmd::VolumeDown),
             ButtonAction::ConsumerKey(0x00E2) => Self::Media(MediaCmd::Mute),
+            ButtonAction::ConsumerKey(0x0192) => Self::Media(MediaCmd::Calculator),
+            ButtonAction::ConsumerKey(0x0223) => Self::Media(MediaCmd::BrowserHome),
+            ButtonAction::ConsumerKey(0x018A) => Self::Media(MediaCmd::Mail),
+            ButtonAction::ConsumerKey(0x0221) => Self::Media(MediaCmd::Search),
+            ButtonAction::Keyboard {
+                modifiers: 0x00,
+                key: 0x46,
+            } => Self::Media(MediaCmd::Screenshot),
             ButtonAction::Keyboard { modifiers, key } => Self::Key {
                 modifiers,
                 hid_key: key,
             },
+            ButtonAction::Macro { page, offset } => Self::Macro {
+                macro_id: format!("hw-macro-{page}-{offset}"),
+                macro_name: format!("Onboard Macro #{page}"),
+            },
             _ => Self::Mouse(MouseCmd::PrimaryClick),
         }
+    }
+}
+
+pub fn media_cmd_to_consumer_usage(cmd: MediaCmd) -> Option<u16> {
+    match cmd {
+        MediaCmd::PlayPause => Some(0x00CD),
+        MediaCmd::Stop => Some(0x00B7),
+        MediaCmd::NextTrack => Some(0x00B5),
+        MediaCmd::PrevTrack => Some(0x00B6),
+        MediaCmd::VolumeUp => Some(0x00E9),
+        MediaCmd::VolumeDown => Some(0x00EA),
+        MediaCmd::Mute => Some(0x00E2),
+        MediaCmd::Calculator => Some(0x0192),
+        MediaCmd::BrowserHome => Some(0x0223),
+        MediaCmd::Mail => Some(0x018A),
+        MediaCmd::Search => Some(0x0221),
+        MediaCmd::Screenshot => None,
+    }
+}
+
+fn media_cmd_to_onboard(cmd: MediaCmd) -> ButtonAction {
+    if let Some(usage) = media_cmd_to_consumer_usage(cmd) {
+        ButtonAction::ConsumerKey(usage)
+    } else {
+        ButtonAction::Keyboard {
+            modifiers: 0x00,
+            key: 0x46,
+        }
+    }
+}
+
+fn ascii_char_to_hid(ch: char) -> Option<(u8, u8)> {
+    match ch {
+        'a'..='z' => Some((0x00, 0x04 + (ch as u8 - b'a'))),
+        'A'..='Z' => Some((0x02, 0x04 + (ch as u8 - b'A'))),
+        '1'..='9' => Some((0x00, 0x1E + (ch as u8 - b'1'))),
+        '0' => Some((0x00, 0x27)),
+        '\n' => Some((0x00, 0x28)),
+        '\t' => Some((0x00, 0x2B)),
+        ' ' => Some((0x00, 0x2C)),
+        '-' => Some((0x00, 0x2D)),
+        '_' => Some((0x02, 0x2D)),
+        '=' => Some((0x00, 0x2E)),
+        '+' => Some((0x02, 0x2E)),
+        '[' => Some((0x00, 0x2F)),
+        '{' => Some((0x02, 0x2F)),
+        ']' => Some((0x00, 0x30)),
+        '}' => Some((0x02, 0x30)),
+        '\\' => Some((0x00, 0x31)),
+        '|' => Some((0x02, 0x31)),
+        ';' => Some((0x00, 0x33)),
+        ':' => Some((0x02, 0x33)),
+        '\'' => Some((0x00, 0x34)),
+        '"' => Some((0x02, 0x34)),
+        '`' => Some((0x00, 0x35)),
+        '~' => Some((0x02, 0x35)),
+        ',' => Some((0x00, 0x36)),
+        '<' => Some((0x02, 0x36)),
+        '.' => Some((0x00, 0x37)),
+        '>' => Some((0x02, 0x37)),
+        '/' => Some((0x00, 0x38)),
+        '?' => Some((0x02, 0x38)),
+        '!' => Some((0x02, 0x1E)),
+        '@' => Some((0x02, 0x1F)),
+        '#' => Some((0x02, 0x20)),
+        '$' => Some((0x02, 0x21)),
+        '%' => Some((0x02, 0x22)),
+        '^' => Some((0x02, 0x23)),
+        '&' => Some((0x02, 0x24)),
+        '*' => Some((0x02, 0x25)),
+        '(' => Some((0x02, 0x26)),
+        ')' => Some((0x02, 0x27)),
+        _ => None,
+    }
+}
+
+fn push_key_press_ops(ops: &mut Vec<OnboardMacroOp>, modifiers: u8, hid_key: u8) {
+    if modifiers != 0 {
+        ops.push(OnboardMacroOp::KeyPress { modifiers, key: 0 });
+    }
+    if hid_key != 0 {
+        ops.push(OnboardMacroOp::KeyPress {
+            modifiers: 0,
+            key: hid_key,
+        });
+    }
+}
+
+fn push_key_release_ops(ops: &mut Vec<OnboardMacroOp>, modifiers: u8, hid_key: u8) {
+    if hid_key != 0 {
+        ops.push(OnboardMacroOp::KeyRelease {
+            modifiers: 0,
+            key: hid_key,
+        });
+    }
+    if modifiers != 0 {
+        ops.push(OnboardMacroOp::KeyRelease { modifiers, key: 0 });
+    }
+}
+
+fn append_steps_to_onboard_ops(
+    steps: &[MacroStep],
+    default_delay: u16,
+    discord: &DiscordSettings,
+    ops: &mut Vec<OnboardMacroOp>,
+) {
+    for step in steps {
+        match step {
+            MacroStep::KeyDown { modifiers, hid_key } => {
+                push_key_press_ops(ops, *modifiers, *hid_key);
+                if default_delay > 0 {
+                    ops.push(OnboardMacroOp::DelayMs(default_delay));
+                }
+            }
+            MacroStep::KeyUp { modifiers, hid_key } => {
+                push_key_release_ops(ops, *modifiers, *hid_key);
+                if default_delay > 0 {
+                    ops.push(OnboardMacroOp::DelayMs(default_delay));
+                }
+            }
+            MacroStep::KeyTap { modifiers, hid_key } => {
+                push_key_press_ops(ops, *modifiers, *hid_key);
+                ops.push(OnboardMacroOp::DelayMs(default_delay.max(15)));
+                push_key_release_ops(ops, *modifiers, *hid_key);
+                if default_delay > 0 {
+                    ops.push(OnboardMacroOp::DelayMs(default_delay));
+                }
+            }
+            MacroStep::MouseClick { button } => {
+                let mask = 1u16.checked_shl((*button).saturating_sub(1) as u32).unwrap_or(1);
+                ops.push(OnboardMacroOp::ButtonDown(mask));
+                ops.push(OnboardMacroOp::DelayMs(default_delay.max(15)));
+                ops.push(OnboardMacroOp::ButtonUp(mask));
+                if default_delay > 0 {
+                    ops.push(OnboardMacroOp::DelayMs(default_delay));
+                }
+            }
+            MacroStep::DelayMs(ms) => {
+                let mut rem = (*ms).max(1);
+                while rem > 0 {
+                    let chunk = rem.min(60000) as u16;
+                    ops.push(OnboardMacroOp::DelayMs(chunk));
+                    rem -= chunk as u32;
+                }
+            }
+            MacroStep::TypeText(txt) => {
+                for ch in txt.chars() {
+                    if let Some((mods, key)) = ascii_char_to_hid(ch) {
+                        push_key_press_ops(ops, mods, key);
+                        ops.push(OnboardMacroOp::DelayMs(12));
+                        push_key_release_ops(ops, mods, key);
+                        ops.push(OnboardMacroOp::DelayMs(12));
+                    }
+                }
+            }
+            MacroStep::Media(m) => {
+                if let Some(usage) = media_cmd_to_consumer_usage(*m) {
+                    ops.push(OnboardMacroOp::ConsumerDown(usage));
+                    ops.push(OnboardMacroOp::DelayMs(20));
+                    ops.push(OnboardMacroOp::ConsumerUp(usage));
+                } else {
+                    push_key_press_ops(ops, 0, 0x46);
+                    ops.push(OnboardMacroOp::DelayMs(20));
+                    push_key_release_ops(ops, 0, 0x46);
+                }
+            }
+            MacroStep::Action(IntegrationAction::Discord(d)) => {
+                let sc = match d {
+                    DiscordAction::ToggleMute => Some(discord.mute_shortcut),
+                    DiscordAction::ToggleDeafen => Some(discord.deafen_shortcut),
+                    DiscordAction::PushToTalk => Some(discord.ptt_shortcut),
+                    _ => None,
+                };
+                if let Some((mods, key)) = sc {
+                    push_key_press_ops(ops, mods, key);
+                    ops.push(OnboardMacroOp::DelayMs(25));
+                    push_key_release_ops(ops, mods, key);
+                }
+            }
+            MacroStep::Action(_) => {}
+        }
+    }
+}
+
+pub fn compile_assignment_to_onboard_macro(
+    item: &RichAssignment,
+    macros: &[UserMacro],
+    discord: &DiscordSettings,
+) -> Option<Vec<OnboardMacroOp>> {
+    match item {
+        RichAssignment::Mouse(MouseCmd::DoubleClick) => Some(vec![
+            OnboardMacroOp::ButtonDown(0x0001),
+            OnboardMacroOp::DelayMs(20),
+            OnboardMacroOp::ButtonUp(0x0001),
+            OnboardMacroOp::DelayMs(35),
+            OnboardMacroOp::ButtonDown(0x0001),
+            OnboardMacroOp::DelayMs(20),
+            OnboardMacroOp::ButtonUp(0x0001),
+        ]),
+        RichAssignment::Macro { macro_id, .. } => {
+            let mac = macros.iter().find(|m| m.id == *macro_id)?;
+            let delay = if mac.use_standard_delay {
+                mac.standard_delay_ms.clamp(5, 5000) as u16
+            } else {
+                15
+            };
+            let mut ops = Vec::new();
+            match mac.kind {
+                MacroKind::NoRepeat => {
+                    append_steps_to_onboard_ops(&mac.steps, delay, discord, &mut ops);
+                }
+                MacroKind::RepeatWhileHolding => {
+                    append_steps_to_onboard_ops(&mac.steps, delay, discord, &mut ops);
+                    ops.push(OnboardMacroOp::DelayMs(delay));
+                    ops.push(OnboardMacroOp::RepeatWhilePressed);
+                }
+                MacroKind::Toggle => {
+                    append_steps_to_onboard_ops(&mac.steps, delay, discord, &mut ops);
+                    ops.push(OnboardMacroOp::DelayMs(delay));
+                    ops.push(OnboardMacroOp::RepeatUntilCanceled);
+                }
+                MacroKind::Sequence => {
+                    append_steps_to_onboard_ops(&mac.on_press, delay, discord, &mut ops);
+                    if mac.while_holding.is_empty() {
+                        ops.push(OnboardMacroOp::WaitForRelease);
+                    } else {
+                        append_steps_to_onboard_ops(&mac.while_holding, delay, discord, &mut ops);
+                        ops.push(OnboardMacroOp::DelayMs(delay));
+                        ops.push(OnboardMacroOp::RepeatWhilePressed);
+                    }
+                    append_steps_to_onboard_ops(&mac.on_release, delay, discord, &mut ops);
+                }
+            }
+            (!ops.is_empty()).then_some(ops)
+        }
+        _ => None,
     }
 }
 
@@ -1081,5 +1351,62 @@ pub fn format_hid_combo(modifiers: u8, hid_key: u8) -> String {
         "Key".into()
     } else {
         parts.join(" + ")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_discord_and_gshift_map_to_onboard() {
+        let disc = DiscordSettings::default();
+        let mute = RichAssignment::Action(IntegrationAction::Discord(DiscordAction::ToggleMute));
+        assert_eq!(
+            mute.to_onboard_with_discord(&disc),
+            ButtonAction::Keyboard {
+                modifiers: 0x03,
+                key: 0x10
+            }
+        );
+        assert!(!mute.is_host_only());
+
+        let gshift = RichAssignment::Mouse(MouseCmd::GShift);
+        assert_eq!(gshift.to_onboard_with_discord(&disc), ButtonAction::Special(0x0B));
+        assert_eq!(
+            RichAssignment::from_onboard(ButtonAction::Special(0x0B)),
+            RichAssignment::Mouse(MouseCmd::GShift)
+        );
+    }
+
+    #[test]
+    fn test_double_click_and_user_macro_compile_to_onboard_ops() {
+        let disc = DiscordSettings::default();
+        let dbl = RichAssignment::Mouse(MouseCmd::DoubleClick);
+        let ops = compile_assignment_to_onboard_macro(&dbl, &[], &disc).unwrap();
+        assert_eq!(ops.len(), 7);
+
+        let mac = UserMacro {
+            id: "m1".into(),
+            name: "Test".into(),
+            kind: MacroKind::RepeatWhileHolding,
+            use_standard_delay: true,
+            standard_delay_ms: 30,
+            show_key_up_down: false,
+            color: None,
+            steps: vec![MacroStep::KeyTap {
+                modifiers: 0x01,
+                hid_key: 0x06,
+            }],
+            on_press: vec![],
+            while_holding: vec![],
+            on_release: vec![],
+        };
+        let item = RichAssignment::Macro {
+            macro_id: "m1".into(),
+            macro_name: "Test".into(),
+        };
+        let mops = compile_assignment_to_onboard_macro(&item, &[mac], &disc).unwrap();
+        assert!(matches!(mops.last(), Some(OnboardMacroOp::RepeatWhilePressed)));
     }
 }

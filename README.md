@@ -4,7 +4,7 @@
 
 # LogiTux
 
-Logitech mouse configuration tool for Linux and Windows, written in Rust.
+Logitech mouse configuration tool for Linux and Windows, written in Rust. Settings are saved directly to mouse onboard memory so you do not need to keep the app open.
 
 ## Download
 
@@ -12,24 +12,23 @@ Packages are published on the [Releases](https://github.com/furkan5665st/logitux
 
 ### Linux
 
-- AppImage (any distribution)
+- AppImage (any distribution, no manual udev setup needed — permissions are granted automatically inside the app):
   ```bash
-  chmod +x LogiTux-0.3.3-x86_64.AppImage
-  ./LogiTux-0.3.3-x86_64.AppImage --install-udev
-  ./LogiTux-0.3.3-x86_64.AppImage
+  chmod +x LogiTux-0.4.0-x86_64.AppImage
+  ./LogiTux-0.4.0-x86_64.AppImage
   ```
-- Fedora / openSUSE
+- Fedora / openSUSE:
   ```bash
-  sudo dnf install ./logitux-0.3.3-1.x86_64.rpm
+  sudo dnf install ./logitux-0.4.0-1.x86_64.rpm
   ```
-- Ubuntu / Debian / Mint
+- Ubuntu / Debian / Mint:
   ```bash
-  sudo apt install ./logitux_0.3.3_amd64.deb
+  sudo apt install ./logitux_0.4.0_amd64.deb
   ```
-- Arch and others
+- Arch and others:
   ```bash
-  tar -xzf LogiTux-0.3.3-linux-x86_64.tar.gz
-  cd LogiTux-0.3.3-linux-x86_64 && ./install.sh
+  tar -xzf LogiTux-0.4.0-linux-x86_64.tar.gz
+  cd LogiTux-0.4.0-linux-x86_64 && ./install.sh
   ```
 
 ### Windows
@@ -38,10 +37,8 @@ Run `LogiTux-Portable-Windows-x64.exe`. No installation required.
 
 ## Features
 
-- DPI stages, DPI shift and report rate
-- LIGHTSYNC presets, per-zone colors and animations
-- Button assignments: shortcuts, keys, media, macros, Discord and OBS actions
-- Profiles and onboard memory
+- Onboard-first hardware sync: DPI stages, DPI shift, polling rate, LIGHTSYNC presets, button mappings, shortcuts, and macros are written directly to mouse onboard flash (`0x8100`)
+- Direct Linux `/dev/hidraw` transport with automatic access setup
 - Multi-language interface
 
 ## Build

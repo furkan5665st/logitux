@@ -1,0 +1,6 @@
+ACTION=="add|change", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="046d", MODE="0666", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="046D", MODE="0666", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="hidraw", KERNELS=="*:046D:*", MODE="0666", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="hidraw", KERNELS=="*:046d:*", MODE="0666", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="hidraw", DRIVERS=="logitech-hidpp-device|logitech-djdevice|logitech-djreceiver", MODE="0666", TAG+="uaccess"
+KERNEL=="uinput", SUBSYSTEM=="misc", OPTIONS+="static_node=uinput", MODE="0666", TAG+="uaccess"

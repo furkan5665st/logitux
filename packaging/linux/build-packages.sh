@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
-VERSION="0.3.3"
+VERSION="0.4.0"
 
 echo "==> [1/6] Tests"
 cargo test --workspace
@@ -25,7 +25,7 @@ mkdir -p \
 
 cp target/release/logitux-gui AppDir/usr/bin/logitux-gui
 cp target/release/logitux AppDir/usr/bin/logitux
-cp udev/99-logitux.rules AppDir/usr/lib/udev/rules.d/99-logitux.rules
+cp udev/60-logitux.rules AppDir/usr/lib/udev/rules.d/60-logitux.rules
 cp assets/logitux.png AppDir/logitux.png
 cp assets/logitux.png AppDir/usr/share/icons/hicolor/256x256/apps/logitux.png
 
@@ -43,16 +43,15 @@ EOF
 cp AppDir/logitux.desktop AppDir/usr/share/applications/logitux.desktop
 
 cat > AppDir/AppRun << 'EOF'
+#!/bin/sh
 HERE="$(dirname "$(readlink -f "${0}")")"
 export PATH="${HERE}/usr/bin:${PATH}"
 if [ "${1:-}" = "--install-udev" ]; then
-  echo "Installing LogiTux udev rules for non-root /dev/hidraw access..."
+  CMD="rm -f /etc/udev/rules.d/99-logitux.rules && cp '${HERE}/usr/lib/udev/rules.d/60-logitux.rules' /etc/udev/rules.d/60-logitux.rules && udevadm control --reload-rules && udevadm trigger --subsystem-match=hidraw --action=change"
   if command -v pkexec >/dev/null 2>&1; then
-    pkexec sh -c "cp '${HERE}/usr/lib/udev/rules.d/99-logitux.rules' /etc/udev/rules.d/99-logitux.rules && udevadm control --reload-rules && udevadm trigger --subsystem-match=hidraw"
+    pkexec sh -c "$CMD"
   else
-    sudo cp "${HERE}/usr/lib/udev/rules.d/99-logitux.rules" /etc/udev/rules.d/99-logitux.rules
-    sudo udevadm control --reload-rules
-    sudo udevadm trigger --subsystem-match=hidraw
+    sudo sh -c "$CMD"
   fi
   exit 0
 fi
@@ -78,11 +77,11 @@ mkdir -p \
   "$DEB_DIR/usr/bin" \
   "$DEB_DIR/lib/udev/rules.d" \
   "$DEB_DIR/usr/share/applications" \
-  "$DEB_DIR/usr/share/icons/hicolor/256x256/apps" \
+  "$DEB_DIR/usr/share/icons/hicolor/256x256/apps"
 
 cp target/release/logitux-gui "$DEB_DIR/usr/bin/logitux-gui"
 cp target/release/logitux "$DEB_DIR/usr/bin/logitux"
-cp udev/99-logitux.rules "$DEB_DIR/lib/udev/rules.d/99-logitux.rules"
+cp udev/60-logitux.rules "$DEB_DIR/lib/udev/rules.d/60-logitux.rules"
 cp AppDir/logitux.desktop "$DEB_DIR/usr/share/applications/logitux.desktop"
 cp assets/logitux.png "$DEB_DIR/usr/share/icons/hicolor/256x256/apps/logitux.png"
 
@@ -92,18 +91,20 @@ Version: ${VERSION}
 Section: utils
 Priority: optional
 Architecture: amd64
-Depends: libc6, libudev1
+Depends: libc6
 Maintainer: LogiTux Contributors
 Description: Logitech mouse configuration tool
- Configure DPI stages, polling rate, 3-zone LIGHTSYNC RGB, and hardware
- onboard button assignments for Logitech mice on Linux.
+ Configure DPI stages, polling rate, LIGHTSYNC RGB, macros, and hardware
+ onboard profiles for Logitech mice on Linux.
 EOF
 
 cat > "$DEB_DIR/DEBIAN/postinst" << 'EOF'
+#!/bin/sh
 set -e
+rm -f /etc/udev/rules.d/99-logitux.rules /lib/udev/rules.d/99-logitux.rules || true
 if command -v udevadm >/dev/null 2>&1; then
   udevadm control --reload-rules || true
-  udevadm trigger --subsystem-match=hidraw || true
+  udevadm trigger --subsystem-match=hidraw --action=change || true
 fi
 EOF
 chmod 755 "$DEB_DIR/DEBIAN/postinst"
@@ -128,20 +129,21 @@ Logitech mouse configuration tool for Linux.
 mkdir -p %{buildroot}/usr/bin %{buildroot}/usr/lib/udev/rules.d %{buildroot}/usr/share/applications %{buildroot}/usr/share/icons/hicolor/256x256/apps
 install -m 755 $ROOT/target/release/logitux-gui %{buildroot}/usr/bin/logitux-gui
 install -m 755 $ROOT/target/release/logitux %{buildroot}/usr/bin/logitux
-install -m 644 $ROOT/udev/99-logitux.rules %{buildroot}/usr/lib/udev/rules.d/99-logitux.rules
+install -m 644 $ROOT/udev/60-logitux.rules %{buildroot}/usr/lib/udev/rules.d/60-logitux.rules
 install -m 644 $ROOT/AppDir/logitux.desktop %{buildroot}/usr/share/applications/logitux.desktop
 install -m 644 $ROOT/assets/logitux.png %{buildroot}/usr/share/icons/hicolor/256x256/apps/logitux.png
 
 %post
+rm -f /etc/udev/rules.d/99-logitux.rules /usr/lib/udev/rules.d/99-logitux.rules || true
 if command -v udevadm >/dev/null 2>&1; then
   udevadm control --reload-rules || true
-  udevadm trigger --subsystem-match=hidraw || true
+  udevadm trigger --subsystem-match=hidraw --action=change || true
 fi
 
 %files
 /usr/bin/logitux-gui
 /usr/bin/logitux
-/usr/lib/udev/rules.d/99-logitux.rules
+/usr/lib/udev/rules.d/60-logitux.rules
 /usr/share/applications/logitux.desktop
 /usr/share/icons/hicolor/256x256/apps/logitux.png
 EOF
@@ -154,7 +156,7 @@ BUNDLE="LogiTux-${VERSION}-linux-x86_64"
 mkdir -p "$BUNDLE"
 cp target/release/logitux-gui "$BUNDLE/logitux-gui"
 cp target/release/logitux "$BUNDLE/logitux"
-cp udev/99-logitux.rules "$BUNDLE/99-logitux.rules"
+cp udev/60-logitux.rules "$BUNDLE/60-logitux.rules"
 cp AppDir/logitux.desktop "$BUNDLE/logitux.desktop"
 cp assets/logitux.png "$BUNDLE/logitux.png"
 cp packaging/linux/install-bin.sh "$BUNDLE/install.sh"

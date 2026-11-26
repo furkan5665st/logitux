@@ -126,9 +126,18 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Probe => {
-            let connected = connect_all_devices()?;
+            let report = logitux_transport::connect_all_devices_diagnosed()?;
+            let connected = report.devices;
             if connected.is_empty() {
-                println!("No active Logitech HID++ 2.0 devices responded.");
+                if !report.permission_denied.is_empty() {
+                    eprintln!("Logitech HID++ devices found, but /dev/hidraw access was denied:");
+                    for b in &report.permission_denied {
+                        eprintln!("  - {} (046D:{:04X}) at {}", b.name, b.product_id, b.path);
+                    }
+                    eprintln!("Run LogiTux GUI to grant access automatically, or run with sudo.");
+                } else {
+                    println!("No active Logitech HID++ 2.0 devices responded.");
+                }
                 return Ok(());
             }
             let summaries: Vec<_> = connected.iter().map(|c| c.device.probe_summary()).collect();

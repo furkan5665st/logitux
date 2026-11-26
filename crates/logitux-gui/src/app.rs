@@ -12,6 +12,7 @@ use logitux_hidpp::{
     },
     FeatureId,
 };
+use logitux_transport::BlockedHidDevice;
 
 use crate::{
     canvas::{self, FullDpiEvent},
@@ -156,6 +157,14 @@ pub struct LogiTuxApp {
     anim_frame_cursor: usize,
 
     onboard_mode: OnboardMode,
+    pending_onboard_commit: Option<Instant>,
+    onboard_saving: bool,
+    onboard_saved_ok: bool,
+
+    blocked_linux_devices: Vec<BlockedHidDevice>,
+    linux_perm_auto_tried: bool,
+    linux_perm_busy: bool,
+    linux_install_persistent_rule: bool,
 
     toast_msg: String,
     toast_err: bool,
@@ -165,12 +174,7 @@ impl LogiTuxApp {
     pub fn new(ctx: egui::Context) -> Self {
         let store = AppStore::load();
         let initial_map = compute_8110_button_map(store.active_profile(), false);
-        let initial_effect = Some(RgbEffect::ColorWave {
-            period_ms: 5000,
-            direction: WaveDirection::Horizontal,
-            brightness: 100,
-        });
-        let hw = HardwareWorkerHandle::spawn(ctx, initial_map, initial_effect);
+        let hw = HardwareWorkerHandle::spawn(ctx, initial_map);
 
         let discord_detected = Arc::new(AtomicBool::new(false));
         let obs_detected = Arc::new(AtomicBool::new(false));
@@ -254,7 +258,14 @@ impl LogiTuxApp {
             selected_anim_idx: 0,
             last_anim_step: Instant::now(),
             anim_frame_cursor: 0,
-            onboard_mode: OnboardMode::Host,
+            onboard_mode: OnboardMode::Onboard,
+            pending_onboard_commit: None,
+            onboard_saving: false,
+            onboard_saved_ok: false,
+            blocked_linux_devices: Vec::new(),
+            linux_perm_auto_tried: false,
+            linux_perm_busy: false,
+            linux_install_persistent_rule: true,
             toast_msg: String::new(),
             toast_err: false,
         }
@@ -271,7 +282,7 @@ impl LogiTuxApp {
     }
 
     fn sync_from_hardware(&mut self) {
-        let Some(m) = self.devices.get(self.selected_idx) else {
+        let Some(m) = self.devices.get(self.selected_idx).cloned() else {
             return;
         };
         if let Some(dpis) = &m.summary.dpi {
@@ -283,7 +294,9 @@ impl LogiTuxApp {
             }
         }
         if let Some(rr) = &m.summary.report_rate {
-            self.store.active_profile_mut().report_rate_hz = rr.current_hz;
+            if rr.current_hz > 0 {
+                self.store.active_profile_mut().report_rate_hz = rr.current_hz;
+            }
             if !rr.supported_hz.is_empty() {
                 let mut r = rr.supported_hz.clone();
                 r.sort_unstable_by(|a, b| b.cmp(a));
@@ -292,11 +305,72 @@ impl LogiTuxApp {
         }
         if let Some(mode) = m.summary.onboard_mode {
             self.onboard_mode = mode;
+            if mode == OnboardMode::Onboard {
+                self.onboard_saved_ok = true;
+            }
         }
         if let Some(prof) = &m.profile {
+            if prof.crc_valid {
+                let discord_cfg = self.store.discord.clone();
+                let active = self.store.active_profile_mut();
+                if prof.dpi_stages.iter().any(|&d| d > 0) {
+                    active.dpi_stages = prof.dpi_stages;
+                    let def_idx = (prof.default_dpi_index as usize).min(4);
+                    if active.dpi_stages[def_idx] > 0 {
+                        active.active_dpi_idx = def_idx;
+                        self.live_dpi = active.dpi_stages[def_idx];
+                    }
+                    let sh_idx = (prof.shift_dpi_index as usize).min(4);
+                    if active.dpi_stages[sh_idx] > 0 {
+                        active.shift_dpi_idx = sh_idx;
+                    }
+                }
+                if prof.report_rate_ms > 0 {
+                    let hz = 1000u16 / (prof.report_rate_ms as u16);
+                    if matches!(hz, 125 | 250 | 500 | 1000) {
+                        active.report_rate_hz = hz;
+                    }
+                }
+                for (i, &hw_act) in prof.buttons.iter().take(6).enumerate() {
+                    if active.buttons[i].to_onboard_with_discord(&discord_cfg) != hw_act
+                        && !matches!(hw_act, logitux_hidpp::features::onboard::ButtonAction::Inherit)
+                    {
+                        if !matches!(
+                            (&active.buttons[i], hw_act),
+                            (
+                                RichAssignment::Macro { .. }
+                                    | RichAssignment::Mouse(MouseCmd::DoubleClick),
+                                logitux_hidpp::features::onboard::ButtonAction::Macro { .. }
+                            )
+                        ) {
+                            active.buttons[i] = RichAssignment::from_onboard(hw_act);
+                        }
+                    }
+                }
+                for (i, &hw_act) in prof.gshift_buttons.iter().take(6).enumerate() {
+                    if active.gshift_buttons[i].to_onboard_with_discord(&discord_cfg) != hw_act
+                        && !matches!(hw_act, logitux_hidpp::features::onboard::ButtonAction::Inherit)
+                    {
+                        if !matches!(
+                            (&active.gshift_buttons[i], hw_act),
+                            (
+                                RichAssignment::Macro { .. }
+                                    | RichAssignment::Mouse(MouseCmd::DoubleClick),
+                                logitux_hidpp::features::onboard::ButtonAction::Macro { .. }
+                            )
+                        ) {
+                            active.gshift_buttons[i] = RichAssignment::from_onboard(hw_act);
+                        }
+                    }
+                }
+            }
             match prof.active_effect_0 {
-                RgbEffect::Off => {}
+                RgbEffect::Off => {
+                    self.lightsync_enabled = false;
+                    self.preset_kind = PresetKind::Off;
+                }
                 RgbEffect::Fixed { color, brightness } => {
+                    self.lightsync_enabled = true;
                     self.preset_kind = PresetKind::Fixed;
                     self.preset_color = [color.r, color.g, color.b];
                     self.preset_brightness = brightness.clamp(1, 100);
@@ -306,17 +380,19 @@ impl LogiTuxApp {
                     period_ms,
                     brightness,
                 } => {
+                    self.lightsync_enabled = true;
                     self.preset_kind = PresetKind::Breathing;
                     self.preset_color = [color.r, color.g, color.b];
-                    self.preset_period_ms = period_ms.clamp(500, 15000);
+                    self.preset_period_ms = period_ms.clamp(500, 20000);
                     self.preset_brightness = brightness.clamp(1, 100);
                 }
                 RgbEffect::ColorCycle {
                     period_ms,
                     brightness,
                 } => {
+                    self.lightsync_enabled = true;
                     self.preset_kind = PresetKind::ColorCycle;
-                    self.preset_period_ms = period_ms.clamp(500, 15000);
+                    self.preset_period_ms = period_ms.clamp(500, 20000);
                     self.preset_brightness = brightness.clamp(1, 100);
                 }
                 RgbEffect::ColorWave {
@@ -324,8 +400,9 @@ impl LogiTuxApp {
                     direction,
                     brightness,
                 } => {
+                    self.lightsync_enabled = true;
                     self.preset_kind = PresetKind::ColorWave;
-                    self.preset_period_ms = period_ms.clamp(500, 15000);
+                    self.preset_period_ms = period_ms.clamp(500, 20000);
                     self.wave_dir = direction;
                     self.preset_brightness = brightness.clamp(1, 100);
                 }
@@ -333,8 +410,9 @@ impl LogiTuxApp {
                     period_ms,
                     brightness,
                 } => {
+                    self.lightsync_enabled = true;
                     self.preset_kind = PresetKind::ColorBlend;
-                    self.preset_period_ms = period_ms.clamp(500, 15000);
+                    self.preset_period_ms = period_ms.clamp(500, 20000);
                     self.preset_brightness = brightness.clamp(1, 100);
                 }
             }
@@ -349,6 +427,35 @@ impl LogiTuxApp {
         self.hw.send(HwCommand::SyncButtonMap(map));
     }
 
+    fn commit_onboard_now(&mut self, notify_toast: bool) {
+        self.pending_onboard_commit = None;
+        if self.devices.is_empty() {
+            return;
+        }
+        self.onboard_saving = true;
+        self.onboard_mode = OnboardMode::Onboard;
+        let profile = self.store.active_profile().clone();
+        let effect = self.current_rgb_effect();
+        let macros = self.store.macros.clone();
+        let discord = self.store.discord.clone();
+        self.hw.send(HwCommand::CommitOnboard {
+            profile,
+            effect,
+            macros,
+            discord,
+            activate_onboard: true,
+            notify_toast,
+        });
+    }
+
+    fn schedule_onboard_commit(&mut self) {
+        if self.devices.is_empty() {
+            return;
+        }
+        self.pending_onboard_commit = Some(Instant::now() + Duration::from_millis(320));
+        self.onboard_saving = true;
+    }
+
     fn activate_profile_by_id(&mut self, prof_id: &str) {
         self.macro_runtime.stop_all();
         if self.store.profiles.iter().any(|p| p.id == prof_id) {
@@ -356,9 +463,8 @@ impl LogiTuxApp {
             self.store.save();
             let p = self.store.active_profile().clone();
             let target_dpi = p.dpi_stages[p.active_dpi_idx.min(4)].max(400);
-            self.apply_live_dpi(target_dpi);
-            self.apply_live_rate(p.report_rate_hz);
-            self.sync_button_map_to_hw();
+            self.live_dpi = target_dpi;
+            self.commit_onboard_now(true);
         }
     }
 
@@ -368,16 +474,19 @@ impl LogiTuxApp {
         let snapped = self.dpi_min + ((clamped - self.dpi_min + step / 2) / step) * step;
         self.live_dpi = snapped.min(self.dpi_max);
         self.hw.send(HwCommand::SetDpi(self.live_dpi));
+        self.schedule_onboard_commit();
     }
 
     fn apply_live_rate(&mut self, hz: u16) {
-        self.onboard_mode = OnboardMode::Host;
         self.store.active_profile_mut().report_rate_hz = hz;
         self.store.save();
-        self.hw.send(HwCommand::SetReportRate(hz));
+        self.commit_onboard_now(false);
     }
 
     fn resync_hardware_settings(&mut self) {
+        if self.onboard_mode == OnboardMode::Onboard {
+            return;
+        }
         self.hw.send(HwCommand::SetDpi(self.live_dpi));
         let rate = self.store.active_profile().report_rate_hz;
         if rate > 0 {
@@ -436,12 +545,16 @@ impl LogiTuxApp {
     }
 
     fn apply_rgb_preset(&mut self, persist: bool) {
-        let eff = self.current_rgb_effect();
-        self.onboard_mode = OnboardMode::Host;
-        self.hw.send(HwCommand::SetRgbPreset {
-            effect: eff,
-            persist,
-        });
+        if persist {
+            self.commit_onboard_now(false);
+        } else {
+            let eff = self.current_rgb_effect();
+            self.hw.send(HwCommand::SetRgbPreset {
+                effect: eff,
+                persist: false,
+            });
+            self.schedule_onboard_commit();
+        }
     }
 
     fn apply_perkey_rgb(&mut self, colors: [RgbColor; 3], persist: bool) {
@@ -450,19 +563,25 @@ impl LogiTuxApp {
     }
 
     fn flash_active_profile_to_slot1(&mut self) {
-        let profile = self.store.active_profile().clone();
-        let effect = self.current_rgb_effect();
-        self.hw.send(HwCommand::FlashSlot1 { profile, effect });
+        self.commit_onboard_now(true);
     }
 
     fn set_onboard_mode_live(&mut self, mode: OnboardMode) {
         self.onboard_mode = mode;
         let profile = self.store.active_profile().clone();
         let effect = self.current_rgb_effect();
+        let macros = self.store.macros.clone();
+        let discord = self.store.discord.clone();
+        if mode == OnboardMode::Onboard {
+            self.onboard_saving = true;
+            self.pending_onboard_commit = None;
+        }
         self.hw.send(HwCommand::SetOnboardMode {
             mode,
             profile,
             effect,
+            macros,
+            discord,
         });
     }
 
@@ -497,6 +616,7 @@ impl LogiTuxApp {
                 return;
             }
         }
+        let host_only = item.is_host_only();
         let prof = self.store.active_profile_mut();
         if self.gshift_layer {
             prof.gshift_buttons[btn_idx] = item;
@@ -504,9 +624,17 @@ impl LogiTuxApp {
             prof.buttons[btn_idx] = item;
         }
         self.store.save();
-        self.sync_button_map_to_hw();
-        if self.onboard_mode == OnboardMode::Onboard {
-            self.flash_active_profile_to_slot1();
+        if host_only {
+            self.sync_button_map_to_hw();
+            self.notify(
+                lang.pick(
+                    "Bu özel eylem bilgisayar bağlantısı (Host modu) gerektirir; diğer tüm ayarlar dahili belleğe yazılır.",
+                    "This action requires Host mode while LogiTux is running.",
+                ),
+                false,
+            );
+        } else {
+            self.commit_onboard_now(true);
         }
     }
 
@@ -751,34 +879,73 @@ impl eframe::App for LogiTuxApp {
                 MacroWizardOutcome::None => {}
                 MacroWizardOutcome::Cancelled => {}
                 MacroWizardOutcome::Saved(mac) => {
+                    let saved_id = mac.id.clone();
                     if let Some(existing) = self.store.macros.iter_mut().find(|m| m.id == mac.id) {
                         *existing = mac;
                     } else {
                         self.store.macros.push(mac);
                     }
                     self.store.save();
+                    let active = self.store.active_profile();
+                    let assigned = active
+                        .buttons
+                        .iter()
+                        .chain(active.gshift_buttons.iter())
+                        .any(|b| matches!(b, RichAssignment::Macro { macro_id, .. } if *macro_id == saved_id));
+                    if assigned {
+                        self.commit_onboard_now(true);
+                    }
                 }
             }
             return;
         }
 
+        if let Some(deadline) = self.pending_onboard_commit {
+            if Instant::now() >= deadline {
+                self.commit_onboard_now(false);
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(80));
+            }
+        }
+
         while let Ok(ev) = self.hw.rx.try_recv() {
             match ev {
-                HwEvent::DevicesUpdated(snaps) => {
+                HwEvent::DevicesUpdated {
+                    devices: snaps,
+                    blocked_linux,
+                } => {
                     let was_empty = self.devices.is_empty();
                     self.devices = snaps;
+                    self.blocked_linux_devices = blocked_linux;
                     if self.devices.is_empty() {
                         self.selected_idx = 0;
                         self.screen = RootScreen::HomeDevices;
                         self.pressed_mask = 0;
-                        self.onboard_mode = OnboardMode::Host;
+                        self.onboard_mode = OnboardMode::Onboard;
+                        self.onboard_saving = false;
+                        self.pending_onboard_commit = None;
+                        if cfg!(target_os = "linux")
+                            && !self.blocked_linux_devices.is_empty()
+                            && !self.linux_perm_auto_tried
+                            && !self.linux_perm_busy
+                        {
+                            self.linux_perm_auto_tried = true;
+                            self.linux_perm_busy = true;
+                            self.hw.send(HwCommand::GrantLinuxAccess {
+                                persistent_rule: self.linux_install_persistent_rule,
+                            });
+                        }
                     } else {
                         self.selected_idx = self.selected_idx.min(self.devices.len() - 1);
                         self.sync_from_hardware();
-                        if was_empty {
+                        if was_empty && self.onboard_mode != OnboardMode::Onboard {
                             self.resync_hardware_settings();
                         }
                     }
+                }
+                HwEvent::LinuxAccessFinished { ok, msg } => {
+                    self.linux_perm_busy = false;
+                    self.notify(msg, !ok);
                 }
                 HwEvent::ButtonMask(mask) => {
                     let prev = self.pressed_mask;
@@ -792,6 +959,10 @@ impl eframe::App for LogiTuxApp {
                     if let Some(d) = self.devices.get_mut(self.selected_idx) {
                         d.summary.onboard_mode = Some(mode);
                     }
+                }
+                HwEvent::OnboardSaved { ok } => {
+                    self.onboard_saving = false;
+                    self.onboard_saved_ok = ok;
                 }
                 HwEvent::StartupEffectChanged(idx, en) => {
                     if let Some(d) = self.devices.get_mut(idx) {
@@ -892,10 +1063,8 @@ impl eframe::App for LogiTuxApp {
                                     *self.store.active_profile_mut() =
                                         ProfileConfig::default_desktop();
                                     self.store.save();
-                                    self.sync_button_map_to_hw();
-                                    self.apply_live_dpi(800);
-                                    self.apply_live_rate(1000);
-                                    self.flash_active_profile_to_slot1();
+                                    self.live_dpi = 800;
+                                    self.commit_onboard_now(true);
                                 }
                             }
                         }
@@ -954,8 +1123,12 @@ impl eframe::App for LogiTuxApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.macro_runtime.stop_all();
+        if self.pending_onboard_commit.is_some() && !self.devices.is_empty() {
+            self.commit_onboard_now(false);
+            std::thread::sleep(Duration::from_millis(280));
+        }
         self.hw.send(HwCommand::Shutdown);
-        std::thread::sleep(Duration::from_millis(35));
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -1093,6 +1266,52 @@ impl LogiTuxApp {
                         }
 
                         ui.add_space(10.0);
+
+                        if !self.devices.is_empty() {
+                            let is_ob = self.onboard_mode == OnboardMode::Onboard;
+                            let (dot_col, badge_txt, tip_txt) = if self.onboard_saving {
+                                (
+                                    theme::GHUB_BLUE,
+                                    lang.pick("BELLEĞE YAZILIYOR...", "SAVING TO MOUSE..."),
+                                    lang.pick(
+                                        "Değişiklikler farenin dahili belleğine yazılıyor.",
+                                        "Writing profile to mouse onboard memory.",
+                                    ),
+                                )
+                            } else if is_ob {
+                                (
+                                    theme::STATUS_GREEN,
+                                    lang.pick("DAHİLİ BELLEKTE", "ONBOARD SAVED"),
+                                    lang.pick(
+                                        "Tüm ayarlar farenin dahili belleğinde kayıtlı. Programı kapatabilirsiniz, her sistemde çalışmaya devam eder. Yeniden yazmak için tıklayın.",
+                                        "All settings are stored in mouse onboard memory. You can close LogiTux and keep using them anywhere. Click to re-write.",
+                                    ),
+                                )
+                            } else {
+                                (
+                                    theme::DPI_AMBER,
+                                    lang.pick("BELLEĞE YAZ", "SAVE TO MOUSE"),
+                                    lang.pick(
+                                        "Mevcut tüm ayarları farenin dahili belleğine yazıp Yerleşik Moda geçmek için tıklayın.",
+                                        "Click to write all settings to mouse onboard memory and activate Onboard Mode.",
+                                    ),
+                                )
+                            };
+                            let ob_pill = egui::Button::new(
+                                RichText::new(format!("● {badge_txt}"))
+                                    .size(11.0)
+                                    .strong()
+                                    .color(dot_col),
+                            )
+                            .fill(Color32::from_rgb(20, 22, 26))
+                            .stroke(Stroke::new(1.0_f32, dot_col.gamma_multiply(0.55)))
+                            .corner_radius(CornerRadius::same(14))
+                            .min_size(Vec2::new(138.0, 28.0));
+                            if ui.add(ob_pill).on_hover_text(tip_txt).clicked() {
+                                self.commit_onboard_now(true);
+                            }
+                            ui.add_space(10.0);
+                        }
 
                         let prof = self.store.active_profile();
                         let app_nm = self.store.app_name_for_profile(prof);
@@ -1293,39 +1512,116 @@ impl LogiTuxApp {
 
         if self.devices.is_empty() {
             ui.vertical_centered(|ui| {
-                ui.add_space(140.0);
-                ui.label(
-                    RichText::new(lang.pick(
-                        "LOGITECH GEAR'INIZI BAĞLAYIN",
-                        "CONNECT YOUR LOGITECH GEAR",
-                    ))
-                    .size(22.0)
-                    .strong()
-                    .color(Color32::WHITE),
-                );
-                ui.add_space(10.0);
-                ui.label(
-                    RichText::new(lang.pick(
-                        "USB veya LIGHTSPEED alıcısını takın (Linux'ta udev kurallarının kurulu olduğundan emin olun).",
-                        "Plug in your Logitech USB or LIGHTSPEED mouse.",
-                    ))
-                    .size(13.0)
-                    .color(theme::TEXT_MUTED),
-                );
-                ui.add_space(20.0);
-                if ui
-                    .add(
-                        egui::Button::new(
-                            RichText::new(lang.pick("CİHAZLARI TARA", "SCAN FOR DEVICES"))
-                                .strong()
-                                .color(Color32::WHITE),
+                if !self.blocked_linux_devices.is_empty() {
+                    ui.add_space(95.0);
+                    ui.label(
+                        RichText::new(lang.pick(
+                            "LOGITECH FARE BULUNDU — ERİŞİM İZNİ GEREKİYOR",
+                            "LOGITECH MOUSE DETECTED — ACCESS PERMISSION NEEDED",
+                        ))
+                        .size(21.0)
+                        .strong()
+                        .color(Color32::WHITE),
+                    );
+                    ui.add_space(10.0);
+                    for blk in &self.blocked_linux_devices {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} (046D:{:04X}) · {}",
+                                blk.name, blk.product_id, blk.path
+                            ))
+                            .size(13.0)
+                            .color(theme::GHUB_BLUE),
+                        );
+                    }
+                    ui.add_space(12.0);
+                    ui.label(
+                        RichText::new(lang.pick(
+                            "Linux çekirdeği /dev/hidraw erişimini varsayılan olarak kısıtlar. Elle kural eklemenize gerek yok; aşağıdaki düğmeye basarak anında izin verip fareyi kullanabilirsiniz.",
+                            "Linux restricts /dev/hidraw by default. No manual udev rules needed; click below to grant access immediately.",
+                        ))
+                        .size(12.5)
+                        .color(theme::TEXT_MUTED),
+                    );
+                    ui.add_space(14.0);
+                    ui.checkbox(
+                        &mut self.linux_install_persistent_rule,
+                        RichText::new(lang.pick(
+                            "Kalıcı yap (sonraki açılışlarda tekrar şifre sormasın)",
+                            "Make persistent (do not ask again on future launches)",
+                        ))
+                        .size(12.0)
+                        .color(theme::TEXT_LIGHT),
+                    );
+                    ui.add_space(16.0);
+                    let btn_lbl = if self.linux_perm_busy {
+                        lang.pick("YETKİLENDİRİLİYOR...", "GRANTING ACCESS...")
+                    } else {
+                        lang.pick("FAREYE ERİŞİM İZNİ VER", "GRANT MOUSE ACCESS")
+                    };
+                    if ui
+                        .add_enabled(
+                            !self.linux_perm_busy,
+                            egui::Button::new(RichText::new(btn_lbl).strong().color(Color32::WHITE))
+                                .fill(theme::GHUB_BLUE)
+                                .min_size(Vec2::new(230.0, 40.0)),
                         )
-                        .fill(theme::GHUB_BLUE)
-                        .min_size(Vec2::new(180.0, 38.0)),
-                    )
-                    .clicked()
-                {
-                    self.scan_devices();
+                        .clicked()
+                    {
+                        self.linux_perm_busy = true;
+                        self.hw.send(HwCommand::GrantLinuxAccess {
+                            persistent_rule: self.linux_install_persistent_rule,
+                        });
+                    }
+                    ui.add_space(10.0);
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(lang.pick("YENİDEN TARA", "RESCAN"))
+                                    .color(theme::TEXT_LIGHT),
+                            )
+                            .fill(theme::BG_CONTROL)
+                            .min_size(Vec2::new(150.0, 32.0)),
+                        )
+                        .clicked()
+                    {
+                        self.scan_devices();
+                    }
+                } else {
+                    ui.add_space(140.0);
+                    ui.label(
+                        RichText::new(lang.pick(
+                            "LOGITECH GEAR'INIZI BAĞLAYIN",
+                            "CONNECT YOUR LOGITECH GEAR",
+                        ))
+                        .size(22.0)
+                        .strong()
+                        .color(Color32::WHITE),
+                    );
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new(lang.pick(
+                            "USB veya LIGHTSPEED alıcısını takın.",
+                            "Plug in your Logitech USB or LIGHTSPEED mouse.",
+                        ))
+                        .size(13.0)
+                        .color(theme::TEXT_MUTED),
+                    );
+                    ui.add_space(20.0);
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(lang.pick("CİHAZLARI TARA", "SCAN FOR DEVICES"))
+                                    .strong()
+                                    .color(Color32::WHITE),
+                            )
+                            .fill(theme::GHUB_BLUE)
+                            .min_size(Vec2::new(180.0, 38.0)),
+                        )
+                        .clicked()
+                    {
+                        self.scan_devices();
+                    }
                 }
             });
             return;
@@ -1888,6 +2184,7 @@ impl LogiTuxApp {
                 FullDpiEvent::SetShiftStage(idx) => {
                     self.store.active_profile_mut().shift_dpi_idx = idx;
                     self.store.save();
+                    self.schedule_onboard_commit();
                 }
                 FullDpiEvent::StartInlineEdit(idx) => {
                     let cur = self.store.active_profile().dpi_stages[idx];
@@ -2633,17 +2930,14 @@ impl LogiTuxApp {
                 ui.add_space(4.0);
                 if theme::ghub_pill_switch(ui, &mut self.lightsync_enabled).changed() {
                     if !self.lightsync_enabled {
-                        self.hw.send(HwCommand::SetRgbPreset {
-                            effect: RgbEffect::Off,
-                            persist: false,
-                        });
+                        self.commit_onboard_now(false);
                     } else if self.rgb_tab == LightsyncSubTab::Freestyle {
                         self.apply_perkey_rgb(self.perkey_colors, false);
                     } else {
                         if self.preset_kind == PresetKind::Off {
                             self.preset_kind = PresetKind::ColorWave;
                         }
-                        self.apply_rgb_preset(false);
+                        self.commit_onboard_now(false);
                     }
                 }
             });
@@ -3142,6 +3436,7 @@ impl LogiTuxApp {
                             _ => self.store.discord.ptt_shortcut = (m, k),
                         }
                         self.store.save();
+                        self.commit_onboard_now(false);
                     }
                     self.recording_discord_shortcut = None;
                 }
@@ -3425,7 +3720,7 @@ impl LogiTuxApp {
         }
 
         if self.about_open {
-            egui::Window::new("LogiTux v0.3.3")
+            egui::Window::new("LogiTux v0.4.0")
                 .collapsible(false)
                 .resizable(false)
                 .open(&mut self.about_open)

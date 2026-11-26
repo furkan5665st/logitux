@@ -71,6 +71,10 @@ impl OnboardDescription {
     pub fn has_gshift(&self) -> bool {
         (self.mechanical_layout & 0x03) == 0x02
     }
+
+    pub fn first_macro_sector(&self) -> u16 {
+        (self.profile_count as u16).max(1) + 1
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,11 +84,97 @@ pub struct ProfileDirectoryEntry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OnboardMacroOp {
+    Noop,
+    WaitForRelease,
+    RepeatWhilePressed,
+    RepeatUntilCanceled,
+    DelayMs(u16),
+    ButtonDown(u16),
+    ButtonUp(u16),
+    KeyPress { modifiers: u8, key: u8 },
+    KeyRelease { modifiers: u8, key: u8 },
+    ConsumerDown(u16),
+    ConsumerUp(u16),
+    End,
+}
+
+impl OnboardMacroOp {
+    pub fn encode_into(self, out: &mut Vec<u8>) {
+        match self {
+            Self::Noop => out.push(0x00),
+            Self::WaitForRelease => out.push(0x01),
+            Self::RepeatWhilePressed => out.push(0x02),
+            Self::RepeatUntilCanceled => out.push(0x03),
+            Self::DelayMs(ms) => {
+                let [hi, lo] = ms.max(1).to_be_bytes();
+                out.extend_from_slice(&[0x40, hi, lo]);
+            }
+            Self::ButtonDown(mask) => {
+                let [hi, lo] = mask.to_be_bytes();
+                out.extend_from_slice(&[0x41, hi, lo]);
+            }
+            Self::ButtonUp(mask) => {
+                let [hi, lo] = mask.to_be_bytes();
+                out.extend_from_slice(&[0x42, hi, lo]);
+            }
+            Self::KeyPress { modifiers, key } => {
+                out.extend_from_slice(&[0x43, modifiers, key]);
+            }
+            Self::KeyRelease { modifiers, key } => {
+                out.extend_from_slice(&[0x44, modifiers, key]);
+            }
+            Self::ConsumerDown(usage) => {
+                let [hi, lo] = usage.to_be_bytes();
+                out.extend_from_slice(&[0x45, hi, lo]);
+            }
+            Self::ConsumerUp(usage) => {
+                let [hi, lo] = usage.to_be_bytes();
+                out.extend_from_slice(&[0x46, hi, lo]);
+            }
+            Self::End => out.push(0xFF),
+        }
+    }
+}
+
+pub fn encode_onboard_macro_bytes(ops: &[OnboardMacroOp], max_len: usize) -> Vec<u8> {
+    let limit = max_len.max(1);
+    let mut out = Vec::with_capacity(limit.min(256));
+    let mut tmp = Vec::with_capacity(4);
+    for &op in ops {
+        if matches!(op, OnboardMacroOp::End) {
+            break;
+        }
+        tmp.clear();
+        op.encode_into(&mut tmp);
+        if out.len() + tmp.len() + 1 > limit {
+            break;
+        }
+        out.extend_from_slice(&tmp);
+    }
+    out.push(0xFF);
+    out
+}
+
+pub fn build_macro_sector_image(stream: &[u8], sector_size: usize) -> Vec<u8> {
+    let mut buf = vec![0xFFu8; sector_size.max(16)];
+    let n = stream.len().min(buf.len());
+    buf[..n].copy_from_slice(&stream[..n]);
+    if n < buf.len() {
+        buf[n] = 0xFF;
+    } else if let Some(last) = buf.last_mut() {
+        *last = 0xFF;
+    }
+    buf
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ButtonAction {
     MouseButton(u16),
     Keyboard { modifiers: u8, key: u8 },
     ConsumerKey(u16),
     Special(u8),
+    Macro { page: u8, offset: u8 },
     Disabled,
     Inherit,
     Raw([u8; 4]),
@@ -93,8 +183,9 @@ pub enum ButtonAction {
 impl ButtonAction {
     pub fn decode(b: [u8; 4]) -> Self {
         match b {
-            [0x00, 0x00, 0x00, 0x00] => Self::Disabled,
+            [0x00, 0x00, 0x00, 0x00] | [0x80, 0x00, _, _] => Self::Disabled,
             [0xFF, 0xFF, 0xFF, 0xFF] => Self::Inherit,
+            [0x00, page, 0x00, offset] => Self::Macro { page, offset },
             [0x80, 0x01, hi, lo] => Self::MouseButton(u16::from_be_bytes([hi, lo])),
             [0x80, 0x02, modifiers, key] => Self::Keyboard { modifiers, key },
             [0x80, 0x03, hi, lo] => Self::ConsumerKey(u16::from_be_bytes([hi, lo])),
@@ -105,8 +196,9 @@ impl ButtonAction {
 
     pub fn encode(self) -> [u8; 4] {
         match self {
-            Self::Disabled => [0x00, 0x00, 0x00, 0x00],
+            Self::Disabled => [0x80, 0x00, 0x00, 0x00],
             Self::Inherit => [0xFF, 0xFF, 0xFF, 0xFF],
+            Self::Macro { page, offset } => [0x00, page, 0x00, offset],
             Self::MouseButton(mask) => {
                 let [hi, lo] = mask.to_be_bytes();
                 [0x80, 0x01, hi, lo]
@@ -125,6 +217,7 @@ impl ButtonAction {
         match *self {
             Self::Disabled => "Disabled".into(),
             Self::Inherit => "Default / Inherit".into(),
+            Self::Macro { page, offset } => format!("Macro (sec {page} +{offset})"),
             Self::MouseButton(0x0001) => "Left Click".into(),
             Self::MouseButton(0x0002) => "Right Click".into(),
             Self::MouseButton(0x0004) => "Middle Click".into(),
@@ -145,9 +238,13 @@ impl ButtonAction {
             Self::Special(0x05) => "DPI Cycle".into(),
             Self::Special(0x06) => "DPI Default".into(),
             Self::Special(0x07) => "DPI Shift (Sniper)".into(),
-            Self::Special(0x08) => "Profile Cycle".into(),
-            Self::Special(0x0A) => "G-Shift".into(),
-            Self::Special(0x0B) => "Battery Check".into(),
+            Self::Special(0x08) => "Next Profile".into(),
+            Self::Special(0x09) => "Previous Profile".into(),
+            Self::Special(0x0A) => "Profile Cycle".into(),
+            Self::Special(0x0B) => "G-Shift".into(),
+            Self::Special(0x0C) => "Battery Check".into(),
+            Self::Special(0x10) => "Scroll Down".into(),
+            Self::Special(0x11) => "Scroll Up".into(),
             Self::Special(c) => format!("Special 0x{c:02X}"),
             Self::Keyboard { modifiers, key } => format_hid_key(modifiers, key),
             Self::Raw(r) => format!("{:02X} {:02X} {:02X} {:02X}", r[0], r[1], r[2], r[3]),
@@ -165,8 +262,10 @@ impl ButtonAction {
             ("DPI Up", Self::Special(0x03)),
             ("DPI Down", Self::Special(0x04)),
             ("DPI Shift (Sniper)", Self::Special(0x07)),
-            ("Profile Cycle", Self::Special(0x08)),
-            ("G-Shift", Self::Special(0x0A)),
+            ("Profile Cycle", Self::Special(0x0A)),
+            ("G-Shift", Self::Special(0x0B)),
+            ("Scroll Up", Self::Special(0x11)),
+            ("Scroll Down", Self::Special(0x10)),
             ("Play / Pause", Self::ConsumerKey(0x00CD)),
             ("Volume Up", Self::ConsumerKey(0x00E9)),
             ("Volume Down", Self::ConsumerKey(0x00EA)),
@@ -450,5 +549,54 @@ mod tests {
         assert_eq!(dpi_cycle, ButtonAction::Special(0x05));
         assert_eq!(dpi_cycle.encode(), [0x90, 0x05, 0xFF, 0xFF]);
         assert_eq!(dpi_cycle.label(), "DPI Cycle");
+
+        let gshift = ButtonAction::Special(0x0B);
+        assert_eq!(gshift.label(), "G-Shift");
+        assert_eq!(ButtonAction::decode(gshift.encode()), gshift);
+
+        let mac = ButtonAction::Macro { page: 2, offset: 0 };
+        assert_eq!(mac.encode(), [0x00, 0x02, 0x00, 0x00]);
+        assert_eq!(ButtonAction::decode(mac.encode()), mac);
+
+        let dis = ButtonAction::Disabled;
+        assert_eq!(dis.encode(), [0x80, 0x00, 0x00, 0x00]);
+        assert_eq!(ButtonAction::decode(dis.encode()), ButtonAction::Disabled);
+    }
+
+    #[test]
+    fn test_onboard_macro_encoding() {
+        let ops = [
+            OnboardMacroOp::ButtonDown(0x0001),
+            OnboardMacroOp::DelayMs(25),
+            OnboardMacroOp::ButtonUp(0x0001),
+            OnboardMacroOp::KeyPress {
+                modifiers: 0x01,
+                key: 0x00,
+            },
+            OnboardMacroOp::KeyPress {
+                modifiers: 0x00,
+                key: 0x06,
+            },
+            OnboardMacroOp::KeyRelease {
+                modifiers: 0x00,
+                key: 0x06,
+            },
+            OnboardMacroOp::KeyRelease {
+                modifiers: 0x01,
+                key: 0x00,
+            },
+        ];
+        let stream = encode_onboard_macro_bytes(&ops, 255);
+        assert_eq!(
+            stream,
+            vec![
+                0x41, 0x00, 0x01, 0x40, 0x00, 0x19, 0x42, 0x00, 0x01, 0x43, 0x01, 0x00, 0x43, 0x00,
+                0x06, 0x44, 0x00, 0x06, 0x44, 0x01, 0x00, 0xFF
+            ]
+        );
+        let img = build_macro_sector_image(&stream, 255);
+        assert_eq!(img.len(), 255);
+        assert_eq!(img[stream.len() - 1], 0xFF);
+        assert_eq!(img[254], 0xFF);
     }
 }

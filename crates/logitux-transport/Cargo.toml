@@ -11,7 +11,7 @@ thiserror.workspace = true
 serde.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-hidapi = { version = "2.6", default-features = false, features = ["linux-native"] }
+libc = "0.2"
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 hidapi = { version = "2.6" }
