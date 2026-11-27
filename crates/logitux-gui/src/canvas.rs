@@ -73,6 +73,25 @@ pub fn compute_preview_zones(
                 hsv_to_color32((base + 0.36 * dir_sign).rem_euclid(1.0), 0.88, v),
             ]
         }
+        RgbEffect::Kitt {
+            fg,
+            bg,
+            period_ms,
+            brightness,
+            ..
+        } => {
+            let p = (period_ms.max(200) as f64) / 1000.0;
+            let phase = ((time_sec / p) * (TAU as f64)) as f32;
+            let scale = brightness as f32 / 100.0;
+            let lerp_zone = |offset: f32| -> Color32 {
+                let w = ((phase - offset).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
+                let r = ((bg.r as f32 * (1.0 - w) + fg.r as f32 * w) * scale) as u8;
+                let g = ((bg.g as f32 * (1.0 - w) + fg.g as f32 * w) * scale) as u8;
+                let b = ((bg.b as f32 * (1.0 - w) + fg.b as f32 * w) * scale) as u8;
+                Color32::from_rgb(r, g, b)
+            };
+            [lerp_zone(0.0), lerp_zone(1.05), lerp_zone(2.10)]
+        }
     }
 }
 

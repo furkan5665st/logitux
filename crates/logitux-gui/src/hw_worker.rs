@@ -119,6 +119,7 @@ pub enum HwCommand {
         macros: Vec<UserMacro>,
         discord: DiscordSettings,
         activate_onboard: bool,
+        keep_host_perkey: Option<[RgbColor; 3]>,
         notify_toast: bool,
     },
     Shutdown(Option<Sender<()>>),
@@ -482,6 +483,7 @@ fn run_worker_loop(
                     macros,
                     discord,
                     activate_onboard,
+                    keep_host_perkey,
                     notify_toast,
                 } => {
                     let ok = commit_onboard_impl(
@@ -492,6 +494,7 @@ fn run_worker_loop(
                         &macros,
                         &discord,
                         activate_onboard,
+                        keep_host_perkey,
                         notify_toast,
                         &mut onboard_mode,
                         &mut rescan_requested,
@@ -524,6 +527,7 @@ fn run_worker_loop(
                             &macros,
                             &discord,
                             true,
+                            None,
                             true,
                             &mut onboard_mode,
                             &mut rescan_requested,
@@ -634,6 +638,14 @@ fn cleanup_all_devices(devices: &[WorkerMouse]) {
         if m.connected.device.has_feature(FeatureId::MOUSE_BUTTON_SPY) {
             let _ = m.connected.device.reset_button_spy_remapping();
             let _ = m.connected.device.stop_button_spy();
+        }
+        let _ = m.connected.device.set_rgb_sw_control(false);
+        if m.connected.device.has_feature(FeatureId::ONBOARD_PROFILES) {
+            let _ = m.connected.device.set_onboard_mode(OnboardMode::Onboard);
+            let _ = m
+                .connected
+                .device
+                .set_active_onboard_profile(m.active_sector);
         }
     }
 }
@@ -757,6 +769,7 @@ fn commit_onboard_impl(
     macros: &[UserMacro],
     discord: &DiscordSettings,
     activate_onboard: bool,
+    keep_host_perkey: Option<[RgbColor; 3]>,
     notify_toast: bool,
     onboard_mode: &mut OnboardMode,
     rescan_requested: &mut bool,
@@ -920,23 +933,56 @@ fn commit_onboard_impl(
 
     match write_res {
         Ok(verified_raw) => {
-            m.connected.device.ensure_rgb_powered();
-            let target_mode = if activate_onboard || prev_mode == OnboardMode::Onboard {
-                OnboardMode::Onboard
-            } else {
-                prev_mode
-            };
-            if target_mode == OnboardMode::Onboard {
-                if m.connected.device.set_onboard_mode(OnboardMode::Onboard).is_ok() {
-                    *onboard_mode = OnboardMode::Onboard;
-                    m.summary.onboard_mode = Some(OnboardMode::Onboard);
-                    let _ = evt_tx.send(HwEvent::OnboardModeChanged(OnboardMode::Onboard));
+            if let Some(colors) = keep_host_perkey {
+                let target_dpi = compacted_dpis[active_idx].max(400);
+                let _ = m.connected.device.set_dpi(0, target_dpi);
+                if active_prof.report_rate_hz > 0 {
+                    let _ = m.connected.device.set_report_rate(active_prof.report_rate_hz);
                 }
-                let _ = m.connected.device.set_active_onboard_profile(sec);
-                let _ = m.connected.device.set_active_onboard_dpi_index(active_dpi_idx);
+                let zones = [
+                    ZoneColor {
+                        zone_id: 1,
+                        color: colors[0],
+                    },
+                    ZoneColor {
+                        zone_id: 2,
+                        color: colors[1],
+                    },
+                    ZoneColor {
+                        zone_id: 3,
+                        color: colors[2],
+                    },
+                ];
+                let _ = m.connected.device.set_perkey_zones(&zones, true);
+                *onboard_mode = OnboardMode::Host;
+                m.summary.onboard_mode = Some(OnboardMode::Host);
+                let _ = evt_tx.send(HwEvent::OnboardModeChanged(OnboardMode::Host));
             } else {
-                *onboard_mode = target_mode;
-                m.summary.onboard_mode = Some(target_mode);
+                let _ = m.connected.device.set_rgb_sw_control(true);
+                let _ = m.connected.device.set_rgb_sw_control(false);
+                let target_mode = if activate_onboard || prev_mode == OnboardMode::Onboard {
+                    OnboardMode::Onboard
+                } else {
+                    prev_mode
+                };
+                if target_mode == OnboardMode::Onboard {
+                    if m.connected.device.set_onboard_mode(OnboardMode::Onboard).is_ok() {
+                        *onboard_mode = OnboardMode::Onboard;
+                        m.summary.onboard_mode = Some(OnboardMode::Onboard);
+                        let _ = evt_tx.send(HwEvent::OnboardModeChanged(OnboardMode::Onboard));
+                    }
+                    let _ = m.connected.device.set_active_onboard_profile(sec);
+                    let _ = m.connected.device.set_active_onboard_dpi_index(active_dpi_idx);
+                } else {
+                    let target_dpi = compacted_dpis[active_idx].max(400);
+                    let _ = m.connected.device.set_dpi(0, target_dpi);
+                    if active_prof.report_rate_hz > 0 {
+                        let _ = m.connected.device.set_report_rate(active_prof.report_rate_hz);
+                    }
+                    let _ = m.connected.device.set_rgb_effect(0, eff, false);
+                    *onboard_mode = target_mode;
+                    m.summary.onboard_mode = Some(target_mode);
+                }
             }
             if let Ok(reloaded) = OnboardProfile::parse(sec, &verified_raw, btn_count) {
                 if let Some(dpis) = &mut m.summary.dpi {

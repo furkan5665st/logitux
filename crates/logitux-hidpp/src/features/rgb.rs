@@ -82,6 +82,13 @@ pub enum RgbEffect {
         period_ms: u16,
         brightness: u8,
     },
+    Kitt {
+        fg: RgbColor,
+        bg: RgbColor,
+        overlap: u8,
+        period_ms: u16,
+        brightness: u8,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +105,7 @@ pub struct RgbClusterInfo {
     pub cluster_index: u8,
     pub location: u16,
     pub location_name: String,
+    pub effect_persistency: u8,
     pub effects: Vec<RgbEffectDescriptor>,
 }
 
@@ -128,12 +136,13 @@ pub fn effect_id_name(id: u16) -> &'static str {
     match id {
         0x0000 => "Off",
         0x0001 => "Fixed",
-        0x0003 => "ColorCycle",
-        0x0004 => "ColorWave",
+        0x0003 | 0x0015 => "ColorCycle",
+        0x0004 | 0x0016 => "ColorWave",
         0x000A => "Breathing",
-        0x000B => "Ripple",
-        0x000C | 0x000D => "ColorBlend",
-        0x000E => "PerKey",
+        0x000B | 0x0017 => "Ripple",
+        0x000C => "CustomOnboard",
+        0x000D => "Kitt",
+        0x000E => "ColorBlend",
         _ => "CustomEffect",
     }
 }
@@ -146,7 +155,8 @@ impl RgbEffect {
             Self::ColorCycle { .. } => 0x0003,
             Self::ColorWave { .. } => 0x0004,
             Self::Breathing { .. } => 0x000A,
-            Self::ColorBlend { .. } => 0x000D,
+            Self::Kitt { .. } => 0x000D,
+            Self::ColorBlend { .. } => 0x000E,
         }
     }
 
@@ -157,7 +167,8 @@ impl RgbEffect {
             Self::ColorCycle { .. } => 0x02,
             Self::ColorWave { .. } => 0x03,
             Self::Breathing { .. } => 0x04,
-            Self::ColorBlend { .. } => 0x05,
+            Self::Kitt { .. } => 0x05,
+            Self::ColorBlend { .. } => 0x06,
         }
     }
 }
@@ -218,10 +229,30 @@ pub fn encode_11byte_effect(effect: RgbEffect) -> [u8; 11] {
             brightness,
         } => {
             let [hi, lo] = period_ms.max(200).to_be_bytes();
-            b[0] = 0x0C;
-            b[6] = hi;
+            b[0] = 0x0E;
             b[7] = lo;
-            b[8] = brightness.clamp(1, 100);
+            b[8] = hi;
+            b[9] = brightness.clamp(1, 100);
+        }
+        RgbEffect::Kitt {
+            fg,
+            bg,
+            overlap,
+            period_ms,
+            brightness,
+        } => {
+            let [hi, lo] = period_ms.max(120).to_be_bytes();
+            b[0] = 0x0D;
+            b[1] = fg.r;
+            b[2] = fg.g;
+            b[3] = fg.b;
+            b[4] = overlap.clamp(1, 100);
+            b[5] = hi;
+            b[6] = lo;
+            b[7] = bg.r;
+            b[8] = bg.g;
+            b[9] = bg.b;
+            b[10] = brightness.clamp(1, 100);
         }
     }
     b
@@ -231,29 +262,41 @@ pub fn decode_11byte_effect(b: &[u8]) -> RgbEffect {
     if b.len() < 11 {
         return RgbEffect::Off;
     }
+    let norm_brightness = |v: u8| if v == 0 || v > 100 { 100 } else { v };
     match b[0] {
         0x00 => RgbEffect::Off,
         0x01 => RgbEffect::Fixed {
             color: RgbColor::new(b[1], b[2], b[3]),
             brightness: 100,
         },
-        0x03 => RgbEffect::ColorCycle {
+        0x03 | 0x15 => RgbEffect::ColorCycle {
             period_ms: u16::from_be_bytes([b[6], b[7]]).max(500),
-            brightness: b[8].clamp(1, 100),
+            brightness: norm_brightness(b[8]),
         },
         0x04 => RgbEffect::ColorWave {
             period_ms: u16::from_be_bytes([b[10], b[7]]).max(500),
             direction: WaveDirection::from_u8(b[8]),
-            brightness: b[9].clamp(1, 100),
+            brightness: norm_brightness(b[9]),
         },
         0x0A => RgbEffect::Breathing {
             color: RgbColor::new(b[1], b[2], b[3]),
             period_ms: u16::from_be_bytes([b[4], b[5]]).max(500),
-            brightness: b[7].clamp(1, 100),
+            brightness: norm_brightness(b[7]),
         },
-        0x0C | 0x0D => RgbEffect::ColorBlend {
+        0x0D => RgbEffect::Kitt {
+            fg: RgbColor::new(b[1], b[2], b[3]),
+            overlap: if b[4] == 0 { 50 } else { b[4].min(100) },
+            period_ms: u16::from_be_bytes([b[5], b[6]]).max(120),
+            bg: RgbColor::new(b[7], b[8], b[9]),
+            brightness: norm_brightness(b[10]),
+        },
+        0x0E => RgbEffect::ColorBlend {
+            period_ms: u16::from_le_bytes([b[7], b[8]]).max(500),
+            brightness: norm_brightness(b[9]),
+        },
+        0x0C => RgbEffect::ColorBlend {
             period_ms: u16::from_be_bytes([b[6], b[7]]).max(500),
-            brightness: b[8].clamp(1, 100),
+            brightness: norm_brightness(b[8]),
         },
         _ => RgbEffect::Off,
     }
@@ -263,24 +306,25 @@ pub fn encode_8071_fn1_with_index(
     cluster_index: u8,
     effect_index: u8,
     effect: RgbEffect,
-    persistent: bool,
+    persist_eeprom: bool,
 ) -> [u8; 16] {
     let mut p = [0u8; 16];
     p[0] = cluster_index;
     p[1] = effect_index;
     let eff = encode_11byte_effect(effect);
     p[2..12].copy_from_slice(&eff[1..11]);
-    p[12] = if persistent { 0x01 } else { 0x00 };
+    p[12] = if persist_eeprom { 0x03 } else { 0x01 };
     p
 }
 
 pub fn encode_8071_fn1(cluster_index: u8, effect: RgbEffect, persistent: bool) -> [u8; 16] {
-    encode_8071_fn1_with_index(
-        cluster_index,
-        effect.default_8071_index(),
-        effect,
-        persistent,
-    )
+    let mut p = [0u8; 16];
+    p[0] = cluster_index;
+    p[1] = effect.default_8071_index();
+    let eff = encode_11byte_effect(effect);
+    p[2..12].copy_from_slice(&eff[1..11]);
+    p[12] = if persistent { 0x01 } else { 0x00 };
+    p
 }
 
 #[cfg(test)]
@@ -334,5 +378,28 @@ mod tests {
         assert_eq!(encode_8071_fn1(0, cycle, true)[1], 0x02);
         assert_eq!(encode_8071_fn1(0, wave, true)[1], 0x03);
         assert_eq!(encode_8071_fn1(0, breath, true)[1], 0x04);
+
+        let kitt = RgbEffect::Kitt {
+            fg: RgbColor::new(0x00, 0xDC, 0xFF),
+            bg: RgbColor::new(0x00, 0x5A, 0xC8),
+            overlap: 50,
+            period_ms: 2000,
+            brightness: 100,
+        };
+        assert_eq!(
+            encode_11byte_effect(kitt),
+            [0x0D, 0x00, 0xDC, 0xFF, 50, 0x07, 0xD0, 0x00, 0x5A, 0xC8, 100]
+        );
+        assert_eq!(decode_11byte_effect(&encode_11byte_effect(kitt)), kitt);
+
+        let blend = RgbEffect::ColorBlend {
+            period_ms: 3000,
+            brightness: 100,
+        };
+        assert_eq!(
+            encode_11byte_effect(blend),
+            [0x0E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xB8, 0x0B, 100, 0x00]
+        );
+        assert_eq!(decode_11byte_effect(&encode_11byte_effect(blend)), blend);
     }
 }

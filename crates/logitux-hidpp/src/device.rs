@@ -455,6 +455,7 @@ impl<T: Transport> HidppDevice<T> {
                     0
                 };
                 let effect_count = cp.get(4).copied().unwrap_or(0);
+                let effect_persistency = cp.get(6).copied().unwrap_or(0);
                 let mut effects = Vec::new();
                 for e in 0..effect_count {
                     if let Ok(er) = self.request_feature(fid, 0, &[c, e, 0x00]) {
@@ -477,6 +478,7 @@ impl<T: Transport> HidppDevice<T> {
                     cluster_index: c,
                     location,
                     location_name: cluster_location_name(location).to_string(),
+                    effect_persistency,
                     effects,
                 });
             }
@@ -542,6 +544,7 @@ impl<T: Transport> HidppDevice<T> {
                     cluster_index: c,
                     location,
                     location_name: cluster_location_name(location).to_string(),
+                    effect_persistency: cp.get(4).copied().unwrap_or(1),
                     effects,
                 });
             }
@@ -562,38 +565,55 @@ impl<T: Transport> HidppDevice<T> {
         cluster_index: u8,
         target_effect_id: u16,
         fallback_index: u8,
-    ) -> (u8, usize) {
+    ) -> (u8, bool, usize) {
         if self.rgb_clusters_cache.borrow().is_none() {
             let _ = self.get_rgb_info();
         }
         if let Some(clusters) = self.rgb_clusters_cache.borrow().as_ref() {
             let count = clusters.len();
             if let Some(cl) = clusters.iter().find(|c| c.cluster_index == cluster_index) {
+                let persist_ok = (cl.effect_persistency & 0x01) != 0;
                 if let Some(desc) = cl.effects.iter().find(|d| {
                     d.effect_id == target_effect_id
-                        || (target_effect_id == 0x000D && d.effect_id == 0x000C)
+                        || (target_effect_id == 0x0003 && d.effect_id == 0x0015)
+                        || (target_effect_id == 0x0004 && d.effect_id == 0x0016)
+                        || (target_effect_id == 0x000E && d.effect_id == 0x000C)
                 }) {
-                    return (desc.effect_index, count);
+                    return (desc.effect_index, persist_ok, count);
                 }
+                return (fallback_index, persist_ok, count);
             }
-            return (fallback_index, count);
+            return (fallback_index, false, count);
         }
-        (fallback_index, 1)
+        (fallback_index, false, 1)
+    }
+
+    pub fn supports_rgb_effect(&self, effect_id: u16) -> bool {
+        if self.rgb_clusters_cache.borrow().is_none() {
+            let _ = self.get_rgb_info();
+        }
+        if let Some(clusters) = self.rgb_clusters_cache.borrow().as_ref() {
+            return clusters
+                .iter()
+                .any(|cl| cl.effects.iter().any(|e| e.effect_id == effect_id));
+        }
+        false
     }
 
     pub fn set_rgb_sw_control(&self, software_controlled: bool) -> Result<()> {
-        let fid = if self.has_feature(FeatureId::RGB_EFFECTS) {
-            FeatureId::RGB_EFFECTS
-        } else if self.has_feature(FeatureId::COLOR_LED_EFFECTS) {
-            FeatureId::COLOR_LED_EFFECTS
-        } else {
-            return Err(HidppError::FeatureUnsupported(FeatureId::RGB_EFFECTS));
-        };
-        let _ = software_controlled;
-        if fid == FeatureId::RGB_EFFECTS {
-            self.ensure_rgb_powered();
+        if self.has_feature(FeatureId::RGB_EFFECTS) {
+            if software_controlled {
+                let _ = self.request_feature(FeatureId::RGB_EFFECTS, 5, &[0x01, 0x03, 0x04]);
+                self.ensure_rgb_powered();
+            } else {
+                let _ = self.request_feature(FeatureId::RGB_EFFECTS, 5, &[0x01, 0x00, 0x00]);
+            }
+            return Ok(());
         }
-        Ok(())
+        if self.has_feature(FeatureId::COLOR_LED_EFFECTS) {
+            return Ok(());
+        }
+        Err(HidppError::FeatureUnsupported(FeatureId::RGB_EFFECTS))
     }
 
     pub fn ensure_rgb_powered(&self) {
@@ -660,20 +680,30 @@ impl<T: Transport> HidppDevice<T> {
                 let _ = self.set_onboard_mode(OnboardMode::Host);
             }
             let _ = self.set_rgb_sw_control(true);
-            let (eff_idx, cluster_count) = self.resolve_8071_effect_index(
+            let (eff_idx, persist_ok, cluster_count) = self.resolve_8071_effect_index(
                 cluster_index,
                 effect.effect_id(),
                 effect.default_8071_index(),
             );
-            let params = encode_8071_fn1_with_index(cluster_index, eff_idx, effect, persistent);
+            let params = encode_8071_fn1_with_index(
+                cluster_index,
+                eff_idx,
+                effect,
+                persistent && persist_ok,
+            );
             self.request_feature(FeatureId::RGB_EFFECTS, 1, &params)?;
             if cluster_index == 0 && cluster_count > 1 {
-                let (eff_idx1, _) = self.resolve_8071_effect_index(
+                let (eff_idx1, persist_ok1, _) = self.resolve_8071_effect_index(
                     1,
                     effect.effect_id(),
                     effect.default_8071_index(),
                 );
-                let params1 = encode_8071_fn1_with_index(1, eff_idx1, effect, persistent);
+                let params1 = encode_8071_fn1_with_index(
+                    1,
+                    eff_idx1,
+                    effect,
+                    persistent && persist_ok1,
+                );
                 let _ = self.request_feature(FeatureId::RGB_EFFECTS, 1, &params1);
             }
             return Ok(());
@@ -704,13 +734,6 @@ impl<T: Transport> HidppDevice<T> {
             let _ = self.set_onboard_mode(OnboardMode::Host);
         }
         let _ = self.set_rgb_sw_control(true);
-        if self.has_feature(FeatureId::RGB_EFFECTS) {
-            let (pk_idx, _) = self.resolve_8071_effect_index(0, 0x000E, 0x06);
-            let mut pk_params = [0u8; 16];
-            pk_params[0] = 0x00;
-            pk_params[1] = pk_idx;
-            let _ = self.request_feature(FeatureId::RGB_EFFECTS, 1, &pk_params);
-        }
         for chunk in zones.chunks(4) {
             let mut params = [0u8; 16];
             for (i, z) in chunk.iter().enumerate() {
@@ -719,6 +742,9 @@ impl<T: Transport> HidppDevice<T> {
                 params[off + 1] = z.color.r;
                 params[off + 2] = z.color.g;
                 params[off + 3] = z.color.b;
+            }
+            if chunk.len() < 4 {
+                params[chunk.len() * 4] = 0xFF;
             }
             self.request_feature(FeatureId::PER_KEY_LIGHTING, 1, &params)?;
         }

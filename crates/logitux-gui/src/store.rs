@@ -885,12 +885,28 @@ impl Default for ObsSettings {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_perkey_rgb() -> [[u8; 3]; 3] {
+    [[255, 0, 128], [0, 184, 252], [148, 56, 255]]
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppStore {
     pub lang: Lang,
     pub home_grid_mode: bool,
     pub dynamic_lighting: bool,
     pub auto_profile_switching: bool,
+    #[serde(default = "default_true")]
+    pub lightsync_enabled: bool,
+    #[serde(default)]
+    pub lightsync_subtab: u8,
+    #[serde(default)]
+    pub selected_anim_idx: usize,
+    #[serde(default = "default_perkey_rgb")]
+    pub perkey_rgb: [[u8; 3]; 3],
     pub persistent_profile_id: Option<String>,
     pub active_profile_id: String,
     pub apps: Vec<AppEntry>,
@@ -910,6 +926,10 @@ impl Default for AppStore {
             home_grid_mode: true,
             dynamic_lighting: false,
             auto_profile_switching: false,
+            lightsync_enabled: true,
+            lightsync_subtab: 0,
+            selected_anim_idx: 0,
+            perkey_rgb: default_perkey_rgb(),
             persistent_profile_id: Some("desktop-default".into()),
             active_profile_id: "desktop-default".into(),
             apps: vec![AppEntry {

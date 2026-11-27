@@ -28,7 +28,7 @@ use crate::{
     store::{
         all_hid_keys, builtin_ghub_commands, format_hid_combo, AppStore, CustomAction,
         CustomActionKind, DiscordAction, IntegrationAction, MediaCmd, MouseCmd, ObsAction,
-        ProfileConfig, RichAssignment, SlobsAction,
+        ProfileConfig, RgbAnimation, RichAssignment, SlobsAction,
     },
     theme,
     views_home::{self, DeviceSettingsEvent, ProfileFilter},
@@ -199,6 +199,33 @@ impl LogiTuxApp {
             });
         }
 
+        let init_rgb_tab = match store.lightsync_subtab {
+            1 => LightsyncSubTab::Freestyle,
+            2 => LightsyncSubTab::Animations,
+            _ => LightsyncSubTab::Presets,
+        };
+        let init_anim_idx = store
+            .selected_anim_idx
+            .min(store.animations.len().saturating_sub(1));
+        let init_perkey = [
+            RgbColor::new(
+                store.perkey_rgb[0][0],
+                store.perkey_rgb[0][1],
+                store.perkey_rgb[0][2],
+            ),
+            RgbColor::new(
+                store.perkey_rgb[1][0],
+                store.perkey_rgb[1][1],
+                store.perkey_rgb[1][2],
+            ),
+            RgbColor::new(
+                store.perkey_rgb[2][0],
+                store.perkey_rgb[2][1],
+                store.perkey_rgb[2][2],
+            ),
+        ];
+        let init_ls_en = store.lightsync_enabled;
+
         Self {
             store,
             hw,
@@ -207,7 +234,7 @@ impl LogiTuxApp {
             screen: RootScreen::HomeDevices,
             dev_tab: DeviceTab::Sensitivity,
             assign_tab: AssignSubTab::Commands,
-            rgb_tab: LightsyncSubTab::Presets,
+            rgb_tab: init_rgb_tab,
             profile_popup_open: false,
             global_settings_open: false,
             about_open: false,
@@ -248,19 +275,15 @@ impl LogiTuxApp {
             macro_wizard: MacroWizardState::default(),
             macro_runtime: MacroRuntime::new(),
             pressed_mask: 0,
-            lightsync_enabled: true,
+            lightsync_enabled: init_ls_en,
             preset_kind: PresetKind::ColorWave,
             preset_color: [0, 149, 255],
             preset_period_ms: 5000,
             preset_brightness: 100,
             wave_dir: WaveDirection::Horizontal,
-            perkey_colors: [
-                RgbColor::new(255, 0, 128),
-                RgbColor::new(0, 184, 252),
-                RgbColor::new(148, 56, 255),
-            ],
+            perkey_colors: init_perkey,
             selected_zone: 0,
-            selected_anim_idx: 0,
+            selected_anim_idx: init_anim_idx,
             last_anim_step: Instant::now(),
             anim_frame_cursor: 0,
             onboard_mode: OnboardMode::Onboard,
@@ -374,6 +397,11 @@ impl LogiTuxApp {
                     self.preset_kind = PresetKind::Fixed;
                     self.preset_color = [color.r, color.g, color.b];
                     self.preset_brightness = brightness.clamp(1, 100);
+                    if self.store.lightsync_subtab == 1 {
+                        self.rgb_tab = LightsyncSubTab::Freestyle;
+                    } else {
+                        self.rgb_tab = LightsyncSubTab::Presets;
+                    }
                 }
                 RgbEffect::Breathing {
                     color,
@@ -381,6 +409,7 @@ impl LogiTuxApp {
                     brightness,
                 } => {
                     self.lightsync_enabled = true;
+                    self.rgb_tab = LightsyncSubTab::Presets;
                     self.preset_kind = PresetKind::Breathing;
                     self.preset_color = [color.r, color.g, color.b];
                     self.preset_period_ms = period_ms.clamp(500, 20000);
@@ -391,6 +420,7 @@ impl LogiTuxApp {
                     brightness,
                 } => {
                     self.lightsync_enabled = true;
+                    self.rgb_tab = LightsyncSubTab::Presets;
                     self.preset_kind = PresetKind::ColorCycle;
                     self.preset_period_ms = period_ms.clamp(500, 20000);
                     self.preset_brightness = brightness.clamp(1, 100);
@@ -401,6 +431,7 @@ impl LogiTuxApp {
                     brightness,
                 } => {
                     self.lightsync_enabled = true;
+                    self.rgb_tab = LightsyncSubTab::Presets;
                     self.preset_kind = PresetKind::ColorWave;
                     self.preset_period_ms = period_ms.clamp(500, 20000);
                     self.wave_dir = direction;
@@ -411,12 +442,177 @@ impl LogiTuxApp {
                     brightness,
                 } => {
                     self.lightsync_enabled = true;
+                    self.rgb_tab = LightsyncSubTab::Presets;
                     self.preset_kind = PresetKind::ColorBlend;
                     self.preset_period_ms = period_ms.clamp(500, 20000);
                     self.preset_brightness = brightness.clamp(1, 100);
                 }
+                RgbEffect::Kitt {
+                    fg,
+                    bg,
+                    period_ms,
+                    brightness,
+                    ..
+                } => {
+                    self.lightsync_enabled = true;
+                    self.rgb_tab = LightsyncSubTab::Animations;
+                    self.preset_brightness = brightness.clamp(1, 100);
+                    let mut best_idx = 0usize;
+                    let mut best_dist = u32::MAX;
+                    for (i, a) in self.store.animations.iter().enumerate() {
+                        let (afg, abg, _) = Self::animation_colors_and_overlap(a);
+                        let dist = (fg.r as i32 - afg.r as i32).unsigned_abs().pow(2)
+                            + (fg.g as i32 - afg.g as i32).unsigned_abs().pow(2)
+                            + (fg.b as i32 - afg.b as i32).unsigned_abs().pow(2)
+                            + (bg.r as i32 - abg.r as i32).unsigned_abs().pow(2)
+                            + (bg.g as i32 - abg.g as i32).unsigned_abs().pow(2)
+                            + (bg.b as i32 - abg.b as i32).unsigned_abs().pow(2);
+                        if dist < best_dist {
+                            best_dist = dist;
+                            best_idx = i;
+                        }
+                    }
+                    self.selected_anim_idx = best_idx;
+                    if let Some(anim) = self.store.animations.get_mut(best_idx) {
+                        anim.frame_ms = ((period_ms as u32) / 8).clamp(80, 1000);
+                    }
+                }
+            }
+            self.save_lightsync_state_to_store();
+        }
+    }
+
+    fn save_lightsync_state_to_store(&mut self) {
+        self.store.lightsync_enabled = self.lightsync_enabled;
+        self.store.lightsync_subtab = match self.rgb_tab {
+            LightsyncSubTab::Presets => 0,
+            LightsyncSubTab::Freestyle => 1,
+            LightsyncSubTab::Animations => 2,
+        };
+        self.store.selected_anim_idx = self.selected_anim_idx;
+        self.store.perkey_rgb = [
+            [
+                self.perkey_colors[0].r,
+                self.perkey_colors[0].g,
+                self.perkey_colors[0].b,
+            ],
+            [
+                self.perkey_colors[1].r,
+                self.perkey_colors[1].g,
+                self.perkey_colors[1].b,
+            ],
+            [
+                self.perkey_colors[2].r,
+                self.perkey_colors[2].g,
+                self.perkey_colors[2].b,
+            ],
+        ];
+        self.store.save();
+    }
+
+    fn selected_device_supports_rgb(&self, effect_id: u16) -> bool {
+        self.devices
+            .get(self.selected_idx)
+            .and_then(|d| d.summary.rgb.as_ref())
+            .is_some_and(|rgb| {
+                rgb.clusters
+                    .iter()
+                    .any(|cl| cl.effects.iter().any(|e| e.effect_id == effect_id))
+            })
+    }
+
+    fn animation_colors_and_overlap(anim: &RgbAnimation) -> (RgbColor, RgbColor, u8) {
+        match anim.id.as_str() {
+            "anim-ocean" => (
+                RgbColor::new(0, 220, 255),
+                RgbColor::new(0, 45, 185),
+                55,
+            ),
+            "anim-cyber" => (
+                RgbColor::new(255, 0, 128),
+                RgbColor::new(0, 184, 252),
+                50,
+            ),
+            "anim-ember" => (
+                RgbColor::new(255, 130, 0),
+                RgbColor::new(160, 8, 0),
+                55,
+            ),
+            "anim-police" => (
+                RgbColor::new(255, 0, 30),
+                RgbColor::new(0, 80, 255),
+                25,
+            ),
+            _ => {
+                if let Some(f0) = anim.frames.first() {
+                    let fg = RgbColor::new(f0[0][0], f0[0][1], f0[0][2]);
+                    let bg = RgbColor::new(f0[2][0], f0[2][1], f0[2][2]);
+                    (fg, bg, 50)
+                } else {
+                    (RgbColor::new(0, 184, 252), RgbColor::new(0, 45, 185), 50)
+                }
             }
         }
+    }
+
+    fn onboard_effect_for_animation(&self, idx: usize) -> RgbEffect {
+        let brightness = self.preset_brightness.clamp(5, 100);
+        if let Some(anim) = self.store.animations.get(idx) {
+            let (fg, bg, overlap) = Self::animation_colors_and_overlap(anim);
+            let period_ms = ((anim.frame_ms.clamp(80, 1000) as u32) * 8).clamp(640, 8000) as u16;
+            if self.selected_device_supports_rgb(0x000D) {
+                return RgbEffect::Kitt {
+                    fg,
+                    bg,
+                    overlap,
+                    period_ms,
+                    brightness,
+                };
+            }
+            return RgbEffect::Breathing {
+                color: fg,
+                period_ms: period_ms.max(800),
+                brightness,
+            };
+        }
+        self.current_rgb_effect()
+    }
+
+    fn effective_onboard_rgb_effect(&self) -> RgbEffect {
+        if !self.lightsync_enabled {
+            return RgbEffect::Off;
+        }
+        match self.rgb_tab {
+            LightsyncSubTab::Presets => self.current_rgb_effect(),
+            LightsyncSubTab::Animations => self.onboard_effect_for_animation(self.selected_anim_idx),
+            LightsyncSubTab::Freestyle => RgbEffect::Fixed {
+                color: self.perkey_colors[self.selected_zone.min(2)],
+                brightness: 100,
+            },
+        }
+    }
+
+    fn active_host_perkey(&self) -> Option<[RgbColor; 3]> {
+        if !self.lightsync_enabled {
+            return None;
+        }
+        if self.rgb_tab == LightsyncSubTab::Freestyle {
+            if self.perkey_colors[0] == self.perkey_colors[1]
+                && self.perkey_colors[1] == self.perkey_colors[2]
+            {
+                return None;
+            }
+            return Some(self.perkey_colors);
+        }
+        None
+    }
+
+    fn has_host_only_buttons(&self) -> bool {
+        let p = self.store.active_profile();
+        p.buttons
+            .iter()
+            .chain(p.gshift_buttons.iter())
+            .any(|b| b.is_host_only())
     }
 
     fn sync_button_map_to_hw(&self) {
@@ -432,9 +628,15 @@ impl LogiTuxApp {
         if self.devices.is_empty() {
             return;
         }
-        self.onboard_mode = OnboardMode::Onboard;
+        let keep_host_perkey = self.active_host_perkey();
+        let activate_onboard = keep_host_perkey.is_none() && !self.has_host_only_buttons();
+        self.onboard_mode = if activate_onboard {
+            OnboardMode::Onboard
+        } else {
+            OnboardMode::Host
+        };
         let profile = self.store.active_profile().clone();
-        let effect = self.current_rgb_effect();
+        let effect = self.effective_onboard_rgb_effect();
         let macros = self.store.macros.clone();
         let discord = self.store.discord.clone();
         self.hw.send(HwCommand::CommitOnboard {
@@ -442,7 +644,8 @@ impl LogiTuxApp {
             effect,
             macros,
             discord,
-            activate_onboard: true,
+            activate_onboard,
+            keep_host_perkey,
             notify_toast,
         });
     }
@@ -549,10 +752,11 @@ impl LogiTuxApp {
     }
 
     fn apply_rgb_preset(&mut self, persist: bool) {
+        self.save_lightsync_state_to_store();
         if persist {
             self.commit_onboard_now(false);
         } else {
-            let eff = self.current_rgb_effect();
+            let eff = self.effective_onboard_rgb_effect();
             self.hw.send(HwCommand::SetRgbPreset {
                 effect: eff,
                 persist: false,
@@ -562,8 +766,15 @@ impl LogiTuxApp {
     }
 
     fn apply_perkey_rgb(&mut self, colors: [RgbColor; 3], persist: bool) {
-        self.onboard_mode = OnboardMode::Host;
-        self.hw.send(HwCommand::SetPerKey { colors, persist });
+        self.save_lightsync_state_to_store();
+        if persist {
+            self.commit_onboard_now(false);
+        } else {
+            self.onboard_mode = OnboardMode::Host;
+            self.hw
+                .send(HwCommand::SetPerKey { colors, persist: false });
+            self.schedule_onboard_commit();
+        }
     }
 
     fn flash_active_profile_to_slot1(&mut self) {
@@ -573,7 +784,7 @@ impl LogiTuxApp {
     fn set_onboard_mode_live(&mut self, mode: OnboardMode) {
         self.onboard_mode = mode;
         let profile = self.store.active_profile().clone();
-        let effect = self.current_rgb_effect();
+        let effect = self.effective_onboard_rgb_effect();
         let macros = self.store.macros.clone();
         let discord = self.store.discord.clone();
         if mode == OnboardMode::Onboard {
@@ -942,8 +1153,15 @@ impl eframe::App for LogiTuxApp {
                     } else {
                         self.selected_idx = self.selected_idx.min(self.devices.len() - 1);
                         self.sync_from_hardware();
-                        if was_empty && self.onboard_mode != OnboardMode::Onboard {
-                            self.resync_hardware_settings();
+                        if was_empty {
+                            if let Some(cols) = self.active_host_perkey() {
+                                self.hw.send(HwCommand::SetPerKey {
+                                    colors: cols,
+                                    persist: true,
+                                });
+                            } else if self.onboard_mode != OnboardMode::Onboard {
+                                self.resync_hardware_settings();
+                            }
                         }
                     }
                 }
@@ -991,10 +1209,16 @@ impl eframe::App for LogiTuxApp {
             ctx.request_repaint_after(Duration::from_millis(33));
         }
 
-        if self.rgb_tab == LightsyncSubTab::Animations {
+        let sw_anim_active = self.lightsync_enabled
+            && self.rgb_tab == LightsyncSubTab::Animations
+            && !self.selected_device_supports_rgb(0x000D)
+            && !self.devices.is_empty();
+        if sw_anim_active {
             if let Some(anim) = self.store.animations.get(self.selected_anim_idx).cloned() {
+                let step_ms = anim.frame_ms.max(80) as u64;
+                ctx.request_repaint_after(Duration::from_millis(step_ms));
                 if !anim.frames.is_empty()
-                    && self.last_anim_step.elapsed().as_millis() >= anim.frame_ms.max(80) as u128
+                    && self.last_anim_step.elapsed() >= Duration::from_millis(step_ms)
                 {
                     self.last_anim_step = Instant::now();
                     self.anim_frame_cursor = (self.anim_frame_cursor + 1) % anim.frames.len();
@@ -1004,7 +1228,9 @@ impl eframe::App for LogiTuxApp {
                         RgbColor::new(f[1][0], f[1][1], f[1][2]),
                         RgbColor::new(f[2][0], f[2][1], f[2][2]),
                     ];
-                    self.apply_perkey_rgb(cols, false);
+                    self.onboard_mode = OnboardMode::Host;
+                    self.hw
+                        .send(HwCommand::SetPerKey { colors: cols, persist: false });
                 }
             }
         }
@@ -1620,20 +1846,31 @@ impl LogiTuxApp {
             return;
         }
 
+        let sw_anim = self.lightsync_enabled
+            && self.rgb_tab == LightsyncSubTab::Animations
+            && !self.selected_device_supports_rgb(0x000D);
+        let anim_f = sw_anim
+            .then(|| {
+                self.store
+                    .animations
+                    .get(self.selected_anim_idx)
+                    .and_then(|a| a.frames.get(self.anim_frame_cursor).copied())
+            })
+            .flatten();
         let zone_colors = canvas::compute_preview_zones(
             time_sec,
             if !self.lightsync_enabled {
                 0
+            } else if self.rgb_tab == LightsyncSubTab::Freestyle {
+                1
+            } else if sw_anim {
+                2
             } else {
-                match self.rgb_tab {
-                    LightsyncSubTab::Presets => 0,
-                    LightsyncSubTab::Freestyle => 1,
-                    LightsyncSubTab::Animations => 2,
-                }
+                0
             },
             self.perkey_colors,
-            None,
-            self.current_rgb_effect(),
+            anim_f,
+            self.effective_onboard_rgb_effect(),
         );
 
         let avail = ui.available_size();
@@ -2939,16 +3176,14 @@ impl LogiTuxApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(4.0);
                 if theme::ghub_pill_switch(ui, &mut self.lightsync_enabled).changed() {
-                    if !self.lightsync_enabled {
-                        self.commit_onboard_now(false);
-                    } else if self.rgb_tab == LightsyncSubTab::Freestyle {
-                        self.apply_perkey_rgb(self.perkey_colors, false);
-                    } else {
-                        if self.preset_kind == PresetKind::Off {
-                            self.preset_kind = PresetKind::ColorWave;
-                        }
-                        self.commit_onboard_now(false);
+                    if self.lightsync_enabled
+                        && self.rgb_tab == LightsyncSubTab::Presets
+                        && self.preset_kind == PresetKind::Off
+                    {
+                        self.preset_kind = PresetKind::ColorWave;
                     }
+                    self.save_lightsync_state_to_store();
+                    self.commit_onboard_now(false);
                 }
             });
         });
@@ -2961,6 +3196,7 @@ impl LogiTuxApp {
                 .iter()
                 .any(|f| f.id == FeatureId::PER_KEY_LIGHTING)
         });
+        let has_anim_support = has_perkey || self.selected_device_supports_rgb(0x000D);
 
         ui.horizontal_wrapped(|ui| {
             for (st, lbl) in [
@@ -2974,7 +3210,10 @@ impl LogiTuxApp {
                     lang.pick("ANİMASYONLAR", "ANIMATIONS"),
                 ),
             ] {
-                if !has_perkey && st != LightsyncSubTab::Presets {
+                if st == LightsyncSubTab::Freestyle && !has_perkey {
+                    continue;
+                }
+                if st == LightsyncSubTab::Animations && !has_anim_support {
                     continue;
                 }
                 let active = self.rgb_tab == st;
@@ -2989,14 +3228,11 @@ impl LogiTuxApp {
                 if ui.add(egui::Button::new(rt).frame(false)).clicked() {
                     self.rgb_tab = st;
                     self.lightsync_enabled = true;
-                    if st == LightsyncSubTab::Presets {
-                        if self.preset_kind == PresetKind::Off {
-                            self.preset_kind = PresetKind::ColorWave;
-                        }
-                        self.apply_rgb_preset(true);
-                    } else if st == LightsyncSubTab::Freestyle {
-                        self.apply_perkey_rgb(self.perkey_colors, true);
+                    if st == LightsyncSubTab::Presets && self.preset_kind == PresetKind::Off {
+                        self.preset_kind = PresetKind::ColorWave;
                     }
+                    self.save_lightsync_state_to_store();
+                    self.commit_onboard_now(false);
                 }
                 ui.add_space(10.0);
             }
@@ -3109,6 +3345,13 @@ impl LogiTuxApp {
                         let cp = ui.color_edit_button_srgb(&mut self.preset_color);
                         if cp.changed() {
                             changed_live = true;
+                            if !cp.dragged() {
+                                persist_now = true;
+                            }
+                        }
+                        if cp.drag_stopped() {
+                            changed_live = true;
+                            persist_now = true;
                         }
                         ui.label(
                             RichText::new(format!(
@@ -3273,8 +3516,8 @@ impl LogiTuxApp {
                 ui.add_space(6.0);
                 ui.label(
                     RichText::new(lang.pick(
-                        "Not: 3 bölgeli Serbest Stil yalnızca program açıkken çalışır. Kalıcı dahili bellek için Ön Ayarlar sekmesini kullanın.",
-                        "Note: 3-zone Freestyle runs while LogiTux is open. Use Presets for persistent onboard memory.",
+                        "Not: 3 ayrı bölge rengi program açıkken aktif olur; program kapalıyken seçili bölge rengi dahili bellekte çalışır.",
+                        "Note: 3 separate zone colors run while open; when closed, the selected zone color runs from onboard memory.",
                     ))
                     .size(10.5)
                     .color(theme::TEXT_DIM),
@@ -3293,6 +3536,7 @@ impl LogiTuxApp {
                     .iter()
                     .map(|a| a.name.clone())
                     .collect();
+                let mut anim_clicked = false;
                 for (ai, aname) in anim_names.iter().enumerate() {
                     let is_sel = self.selected_anim_idx == ai;
                     if ui
@@ -3308,8 +3552,12 @@ impl LogiTuxApp {
                     {
                         self.selected_anim_idx = ai;
                         self.anim_frame_cursor = 0;
+                        self.lightsync_enabled = true;
+                        anim_clicked = true;
                     }
                 }
+                let mut speed_live = false;
+                let mut speed_commit = false;
                 if let Some(anim) = self.store.animations.get_mut(self.selected_anim_idx) {
                     ui.add_space(12.0);
                     ui.label(
@@ -3317,12 +3565,29 @@ impl LogiTuxApp {
                             .size(11.0)
                             .color(theme::TEXT_MUTED),
                     );
-                    if ui
-                        .add(egui::Slider::new(&mut anim.frame_ms, 80..=1000).suffix(" ms"))
-                        .changed()
-                    {
-                        self.store.save();
+                    let sl =
+                        ui.add(egui::Slider::new(&mut anim.frame_ms, 80..=1000).suffix(" ms"));
+                    if sl.drag_stopped() {
+                        speed_live = true;
+                        speed_commit = true;
+                    } else if sl.changed() {
+                        speed_live = true;
+                        if !sl.dragged() {
+                            speed_commit = true;
+                        }
                     }
+                }
+                if anim_clicked || speed_commit {
+                    self.save_lightsync_state_to_store();
+                    self.commit_onboard_now(false);
+                } else if speed_live {
+                    self.save_lightsync_state_to_store();
+                    let eff = self.effective_onboard_rgb_effect();
+                    self.hw.send(HwCommand::SetRgbPreset {
+                        effect: eff,
+                        persist: false,
+                    });
+                    self.schedule_onboard_commit();
                 }
             }
         }
@@ -3330,7 +3595,10 @@ impl LogiTuxApp {
 
     fn render_lightsync_stage(&mut self, ui: &mut egui::Ui) {
         let time_sec = ui.input(|i| i.time);
-        let anim_f = (self.rgb_tab == LightsyncSubTab::Animations)
+        let sw_anim = self.lightsync_enabled
+            && self.rgb_tab == LightsyncSubTab::Animations
+            && !self.selected_device_supports_rgb(0x000D);
+        let anim_f = sw_anim
             .then(|| {
                 self.store
                     .animations
@@ -3342,16 +3610,16 @@ impl LogiTuxApp {
             time_sec,
             if !self.lightsync_enabled {
                 0
+            } else if self.rgb_tab == LightsyncSubTab::Freestyle {
+                1
+            } else if sw_anim {
+                2
             } else {
-                match self.rgb_tab {
-                    LightsyncSubTab::Presets => 0,
-                    LightsyncSubTab::Freestyle => 1,
-                    LightsyncSubTab::Animations => 2,
-                }
+                0
             },
             self.perkey_colors,
             anim_f,
-            self.current_rgb_effect(),
+            self.effective_onboard_rgb_effect(),
         );
         let is_free = self.rgb_tab == LightsyncSubTab::Freestyle;
         let out = canvas::draw_ghub_mouse_stage(
@@ -3748,7 +4016,7 @@ impl LogiTuxApp {
         }
 
         if self.about_open {
-            egui::Window::new("LogiTux v0.4.2")
+            egui::Window::new(concat!("LogiTux v", env!("CARGO_PKG_VERSION")))
                 .collapsible(false)
                 .resizable(false)
                 .open(&mut self.about_open)

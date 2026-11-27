@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
-VERSION="0.4.2"
+VERSION="0.4.3"
 
 echo "==> [1/6] Tests"
 cargo test --workspace

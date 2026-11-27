@@ -1806,7 +1806,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "logitux-cli"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "clap",
  "logitux-devices",
@@ -1818,14 +1818,14 @@ dependencies = [
 
 [[package]]
 name = "logitux-devices"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "logitux-gui"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "eframe",
  "libc",
@@ -1839,7 +1839,7 @@ dependencies = [
 
 [[package]]
 name = "logitux-hidpp"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -1847,7 +1847,7 @@ dependencies = [
 
 [[package]]
 name = "logitux-transport"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "hidapi",
  "libc",
