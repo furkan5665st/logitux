@@ -410,7 +410,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 "dump" => {
                     let desc = c.device.get_onboard_description()?;
-                    for sec in 0..desc.profile_count.min(4) {
+                    for sec in 0..=desc.profile_count.min(4) {
                         let data = c.device.read_onboard_sector(sec as u16, desc.sector_size)?;
                         println!("--- Sector 0x{sec:04X} ({} bytes) ---", data.len());
                         for (row, chunk) in data.chunks(16).enumerate() {

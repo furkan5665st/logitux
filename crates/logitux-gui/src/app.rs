@@ -160,8 +160,6 @@ pub struct LogiTuxApp {
 
     onboard_mode: OnboardMode,
     pending_onboard_commit: Option<Instant>,
-    onboard_saving: bool,
-    onboard_saved_ok: bool,
 
     blocked_linux_devices: Vec<BlockedHidDevice>,
     linux_perm_auto_tried: bool,
@@ -267,8 +265,6 @@ impl LogiTuxApp {
             anim_frame_cursor: 0,
             onboard_mode: OnboardMode::Onboard,
             pending_onboard_commit: None,
-            onboard_saving: false,
-            onboard_saved_ok: false,
             blocked_linux_devices: Vec::new(),
             linux_perm_auto_tried: false,
             linux_perm_busy: false,
@@ -312,9 +308,6 @@ impl LogiTuxApp {
         }
         if let Some(mode) = m.summary.onboard_mode {
             self.onboard_mode = mode;
-            if mode == OnboardMode::Onboard {
-                self.onboard_saved_ok = true;
-            }
         }
         if let Some(prof) = &m.profile {
             if prof.crc_valid {
@@ -439,7 +432,6 @@ impl LogiTuxApp {
         if self.devices.is_empty() {
             return;
         }
-        self.onboard_saving = true;
         self.onboard_mode = OnboardMode::Onboard;
         let profile = self.store.active_profile().clone();
         let effect = self.current_rgb_effect();
@@ -460,7 +452,6 @@ impl LogiTuxApp {
             return;
         }
         self.pending_onboard_commit = Some(Instant::now() + Duration::from_millis(320));
-        self.onboard_saving = true;
     }
 
     fn activate_profile_by_id(&mut self, prof_id: &str) {
@@ -471,17 +462,23 @@ impl LogiTuxApp {
             let p = self.store.active_profile().clone();
             let target_dpi = p.dpi_stages[p.active_dpi_idx.min(4)].max(400);
             self.live_dpi = target_dpi;
-            self.commit_onboard_now(true);
+            self.commit_onboard_now(false);
         }
     }
 
-    fn apply_live_dpi(&mut self, dpi: u16) {
+    fn apply_live_dpi(&mut self, dpi: u16, commit_now: bool) {
         let clamped = dpi.clamp(self.dpi_min, self.dpi_max);
         let step = self.dpi_step.max(1);
         let snapped = self.dpi_min + ((clamped - self.dpi_min + step / 2) / step) * step;
         self.live_dpi = snapped.min(self.dpi_max);
-        self.hw.send(HwCommand::SetDpi(self.live_dpi));
-        self.schedule_onboard_commit();
+        if self.onboard_mode != OnboardMode::Onboard {
+            self.hw.send(HwCommand::SetDpi(self.live_dpi));
+        }
+        if commit_now {
+            self.commit_onboard_now(false);
+        } else {
+            self.schedule_onboard_commit();
+        }
     }
 
     fn apply_live_rate(&mut self, hz: u16) {
@@ -580,7 +577,6 @@ impl LogiTuxApp {
         let macros = self.store.macros.clone();
         let discord = self.store.discord.clone();
         if mode == OnboardMode::Onboard {
-            self.onboard_saving = true;
             self.pending_onboard_commit = None;
         }
         self.hw.send(HwCommand::SetOnboardMode {
@@ -632,6 +628,7 @@ impl LogiTuxApp {
         }
         self.store.save();
         if host_only {
+            self.set_onboard_mode_live(OnboardMode::Host);
             self.sync_button_map_to_hw();
             self.notify(
                 lang.pick(
@@ -641,7 +638,7 @@ impl LogiTuxApp {
                 false,
             );
         } else {
-            self.commit_onboard_now(true);
+            self.commit_onboard_now(false);
         }
     }
 
@@ -725,7 +722,7 @@ impl LogiTuxApp {
                         let next_i = enabled[(cur_pos + 1) % enabled.len()];
                         self.store.active_profile_mut().active_dpi_idx = next_i;
                         self.store.save();
-                        self.apply_live_dpi(prof.dpi_stages[next_i]);
+                        self.apply_live_dpi(prof.dpi_stages[next_i], false);
                     }
                 }
                 MouseCmd::DpiUp => {
@@ -738,7 +735,7 @@ impl LogiTuxApp {
                     if let Some(&next_i) = enabled.iter().find(|&&i| i > prof.active_dpi_idx) {
                         self.store.active_profile_mut().active_dpi_idx = next_i;
                         self.store.save();
-                        self.apply_live_dpi(prof.dpi_stages[next_i]);
+                        self.apply_live_dpi(prof.dpi_stages[next_i], false);
                     }
                 }
                 MouseCmd::DpiDown => {
@@ -752,14 +749,14 @@ impl LogiTuxApp {
                     {
                         self.store.active_profile_mut().active_dpi_idx = prev_i;
                         self.store.save();
-                        self.apply_live_dpi(prof.dpi_stages[prev_i]);
+                        self.apply_live_dpi(prof.dpi_stages[prev_i], false);
                     }
                 }
                 MouseCmd::DpiShift => {
                     let s_dpi = prof.dpi_stages[prof.shift_dpi_idx.min(4)];
                     if s_dpi > 0 {
                         self.dpi_shift_held_live = true;
-                        self.apply_live_dpi(s_dpi);
+                        self.apply_live_dpi(s_dpi, false);
                     }
                 }
                 MouseCmd::GoToDpiShift => {
@@ -767,11 +764,11 @@ impl LogiTuxApp {
                     if prof.dpi_stages[s_idx] > 0 {
                         self.store.active_profile_mut().active_dpi_idx = s_idx;
                         self.store.save();
-                        self.apply_live_dpi(prof.dpi_stages[s_idx]);
+                        self.apply_live_dpi(prof.dpi_stages[s_idx], false);
                     }
                 }
                 MouseCmd::DefaultDpi => {
-                    self.apply_live_dpi(800);
+                    self.apply_live_dpi(800, false);
                 }
                 MouseCmd::DoubleClick => {
                     std::thread::spawn(|| {
@@ -859,7 +856,7 @@ impl LogiTuxApp {
                 if self.dpi_shift_held_live {
                     self.dpi_shift_held_live = false;
                     let restore = prof.dpi_stages[prof.active_dpi_idx.min(4)].max(800);
-                    self.apply_live_dpi(restore);
+                    self.apply_live_dpi(restore, false);
                 }
             }
             RichAssignment::Key { modifiers, hid_key } => {
@@ -900,7 +897,7 @@ impl eframe::App for LogiTuxApp {
                         .chain(active.gshift_buttons.iter())
                         .any(|b| matches!(b, RichAssignment::Macro { macro_id, .. } if *macro_id == saved_id));
                     if assigned {
-                        self.commit_onboard_now(true);
+                        self.commit_onboard_now(false);
                     }
                 }
             }
@@ -929,7 +926,6 @@ impl eframe::App for LogiTuxApp {
                         self.screen = RootScreen::HomeDevices;
                         self.pressed_mask = 0;
                         self.onboard_mode = OnboardMode::Onboard;
-                        self.onboard_saving = false;
                         self.pending_onboard_commit = None;
                         if cfg!(target_os = "linux")
                             && !self.blocked_linux_devices.is_empty()
@@ -968,9 +964,15 @@ impl eframe::App for LogiTuxApp {
                         d.summary.onboard_mode = Some(mode);
                     }
                 }
-                HwEvent::OnboardSaved { ok } => {
-                    self.onboard_saving = false;
-                    self.onboard_saved_ok = ok;
+                HwEvent::ProfileUpdated {
+                    idx,
+                    profile,
+                    summary,
+                } => {
+                    if let Some(d) = self.devices.get_mut(idx) {
+                        d.profile = Some(*profile);
+                        d.summary = *summary;
+                    }
                 }
                 HwEvent::StartupEffectChanged(idx, en) => {
                     if let Some(d) = self.devices.get_mut(idx) {
@@ -1276,52 +1278,6 @@ impl LogiTuxApp {
                         }
 
                         ui.add_space(10.0);
-
-                        if !self.devices.is_empty() {
-                            let is_ob = self.onboard_mode == OnboardMode::Onboard;
-                            let (dot_col, badge_txt, tip_txt) = if self.onboard_saving {
-                                (
-                                    theme::GHUB_BLUE,
-                                    lang.pick("BELLEĞE YAZILIYOR...", "SAVING TO MOUSE..."),
-                                    lang.pick(
-                                        "Değişiklikler farenin dahili belleğine yazılıyor.",
-                                        "Writing profile to mouse onboard memory.",
-                                    ),
-                                )
-                            } else if is_ob {
-                                (
-                                    theme::STATUS_GREEN,
-                                    lang.pick("DAHİLİ BELLEKTE", "ONBOARD SAVED"),
-                                    lang.pick(
-                                        "Tüm ayarlar farenin dahili belleğinde kayıtlı. Programı kapatabilirsiniz, her sistemde çalışmaya devam eder. Yeniden yazmak için tıklayın.",
-                                        "All settings are stored in mouse onboard memory. You can close LogiTux and keep using them anywhere. Click to re-write.",
-                                    ),
-                                )
-                            } else {
-                                (
-                                    theme::DPI_AMBER,
-                                    lang.pick("BELLEĞE YAZ", "SAVE TO MOUSE"),
-                                    lang.pick(
-                                        "Mevcut tüm ayarları farenin dahili belleğine yazıp Yerleşik Moda geçmek için tıklayın.",
-                                        "Click to write all settings to mouse onboard memory and activate Onboard Mode.",
-                                    ),
-                                )
-                            };
-                            let ob_pill = egui::Button::new(
-                                RichText::new(format!("● {badge_txt}"))
-                                    .size(11.0)
-                                    .strong()
-                                    .color(dot_col),
-                            )
-                            .fill(Color32::from_rgb(20, 22, 26))
-                            .stroke(Stroke::new(1.0_f32, dot_col.gamma_multiply(0.55)))
-                            .corner_radius(CornerRadius::same(14))
-                            .min_size(Vec2::new(138.0, 28.0));
-                            if ui.add(ob_pill).on_hover_text(tip_txt).clicked() {
-                                self.commit_onboard_now(true);
-                            }
-                            ui.add_space(10.0);
-                        }
 
                         let prof = self.store.active_profile();
                         let app_nm = self.store.app_name_for_profile(prof);
@@ -1850,9 +1806,12 @@ impl LogiTuxApp {
             self.set_onboard_mode_live(target_mode);
         }
         if let Some(idx) = enter_device {
+            let switched = idx != self.selected_idx;
             self.selected_idx = idx;
-            self.hw.send(HwCommand::SelectDevice(idx));
-            self.sync_from_hardware();
+            if switched {
+                self.hw.send(HwCommand::SelectDevice(idx));
+                self.sync_from_hardware();
+            }
             self.screen = RootScreen::DeviceStudio;
         }
     }
@@ -2028,7 +1987,7 @@ impl LogiTuxApp {
         if let Some((idx, dpi)) = clicked_stage {
             self.store.active_profile_mut().active_dpi_idx = idx;
             self.store.save();
-            self.apply_live_dpi(dpi);
+            self.apply_live_dpi(dpi, true);
         }
 
         ui.add_space(14.0);
@@ -2142,8 +2101,8 @@ impl LogiTuxApp {
             p.shift_dpi_idx = 0;
             p.report_rate_hz = 1000;
             self.store.save();
-            self.apply_live_dpi(800);
-            self.apply_live_rate(1000);
+            self.live_dpi = 800;
+            self.commit_onboard_now(false);
         }
     }
 
@@ -2169,7 +2128,7 @@ impl LogiTuxApp {
             p.dpi_stages[idx] = new_dpi;
             p.active_dpi_idx = idx;
             self.store.save();
-            self.apply_live_dpi(new_dpi);
+            self.apply_live_dpi(new_dpi, true);
         }
 
         if let Some(event) = ev {
@@ -2179,7 +2138,7 @@ impl LogiTuxApp {
                     self.store.active_profile_mut().active_dpi_idx = idx;
                     self.store.save();
                     if dpi > 0 {
-                        self.apply_live_dpi(dpi);
+                        self.apply_live_dpi(dpi, true);
                     }
                 }
                 FullDpiEvent::DragStage {
@@ -2193,7 +2152,7 @@ impl LogiTuxApp {
                     self.live_dpi = dpi;
                     if committed {
                         self.store.save();
-                        self.apply_live_dpi(dpi);
+                        self.apply_live_dpi(dpi, true);
                     }
                 }
                 FullDpiEvent::DeleteStage(idx) => {
@@ -2206,7 +2165,7 @@ impl LogiTuxApp {
                     p.shift_dpi_idx = new_sh;
                     let d = p.dpi_stages[new_act];
                     self.store.save();
-                    self.apply_live_dpi(d);
+                    self.apply_live_dpi(d, true);
                 }
                 FullDpiEvent::AddStage(dpi) => {
                     let p = self.store.active_profile_mut();
@@ -2214,13 +2173,13 @@ impl LogiTuxApp {
                         p.dpi_stages[empty] = dpi;
                         p.active_dpi_idx = empty;
                         self.store.save();
-                        self.apply_live_dpi(dpi);
+                        self.apply_live_dpi(dpi, true);
                     }
                 }
                 FullDpiEvent::SetShiftStage(idx) => {
                     self.store.active_profile_mut().shift_dpi_idx = idx;
                     self.store.save();
-                    self.schedule_onboard_commit();
+                    self.commit_onboard_now(false);
                 }
                 FullDpiEvent::StartInlineEdit(idx) => {
                     let cur = self.store.active_profile().dpi_stages[idx];
@@ -2702,7 +2661,22 @@ impl LogiTuxApp {
                     }
                     if let Some(did) = delete_mac_id {
                         self.store.macros.retain(|m| m.id != did);
+                        let mut affected = false;
+                        for prof in &mut self.store.profiles {
+                            let is_active = prof.id == self.store.active_profile_id;
+                            for b in prof.buttons.iter_mut().chain(prof.gshift_buttons.iter_mut()) {
+                                if matches!(b, RichAssignment::Macro { macro_id, .. } if *macro_id == did) {
+                                    *b = RichAssignment::Mouse(MouseCmd::Disabled);
+                                    if is_active {
+                                        affected = true;
+                                    }
+                                }
+                            }
+                        }
                         self.store.save();
+                        if affected {
+                            self.commit_onboard_now(false);
+                        }
                     }
                 }
                 AssignSubTab::System => {
@@ -3133,9 +3107,8 @@ impl LogiTuxApp {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         let cp = ui.color_edit_button_srgb(&mut self.preset_color);
-                        if cp.drag_stopped() || (cp.changed() && !cp.dragged()) {
+                        if cp.changed() {
                             changed_live = true;
-                            persist_now = true;
                         }
                         ui.label(
                             RichText::new(format!(
@@ -3189,9 +3162,14 @@ impl LogiTuxApp {
                                 .step_by(250.0)
                                 .show_value(false),
                         );
-                        if s.drag_stopped() || (s.changed() && !s.dragged()) {
+                        if s.drag_stopped() {
                             changed_live = true;
                             persist_now = true;
+                        } else if s.changed() {
+                            changed_live = true;
+                            if !s.dragged() {
+                                persist_now = true;
+                            }
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(
@@ -3217,9 +3195,14 @@ impl LogiTuxApp {
                             egui::Slider::new(&mut self.preset_brightness, 5..=100)
                                 .show_value(false),
                         );
-                        if b.drag_stopped() || (b.changed() && !b.dragged()) {
+                        if b.drag_stopped() {
                             changed_live = true;
                             persist_now = true;
+                        } else if b.changed() {
+                            changed_live = true;
+                            if !b.dragged() {
+                                persist_now = true;
+                            }
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(
@@ -3287,6 +3270,15 @@ impl LogiTuxApp {
                 if apply_live {
                     self.apply_perkey_rgb(self.perkey_colors, persist_now);
                 }
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(lang.pick(
+                        "Not: 3 bölgeli Serbest Stil yalnızca program açıkken çalışır. Kalıcı dahili bellek için Ön Ayarlar sekmesini kullanın.",
+                        "Note: 3-zone Freestyle runs while LogiTux is open. Use Presets for persistent onboard memory.",
+                    ))
+                    .size(10.5)
+                    .color(theme::TEXT_DIM),
+                );
             }
             LightsyncSubTab::Animations => {
                 ui.label(
@@ -3756,7 +3748,7 @@ impl LogiTuxApp {
         }
 
         if self.about_open {
-            egui::Window::new("LogiTux v0.4.1")
+            egui::Window::new("LogiTux v0.4.2")
                 .collapsible(false)
                 .resizable(false)
                 .open(&mut self.about_open)

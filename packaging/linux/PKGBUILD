@@ -1,5 +1,5 @@
 pkgname=logitux
-pkgver=0.4.1
+pkgver=0.4.2
 pkgrel=1
 pkgdesc="Logitech mouse configuration tool"
 arch=('x86_64')

@@ -777,12 +777,12 @@ impl<T: Transport> HidppDevice<T> {
     }
 
     pub fn get_active_onboard_dpi_index(&self) -> Result<u8> {
-        let r = self.request_feature(FeatureId::ONBOARD_PROFILES, 9, &[])?;
+        let r = self.request_feature(FeatureId::ONBOARD_PROFILES, 11, &[])?;
         Ok(r.params()[0])
     }
 
     pub fn set_active_onboard_dpi_index(&self, dpi_index: u8) -> Result<()> {
-        self.request_feature(FeatureId::ONBOARD_PROFILES, 10, &[dpi_index])?;
+        self.request_feature(FeatureId::ONBOARD_PROFILES, 12, &[dpi_index])?;
         Ok(())
     }
 
@@ -867,36 +867,30 @@ impl<T: Transport> HidppDevice<T> {
         Ok(())
     }
 
+    pub fn write_onboard_sector_verified(&self, sector_id: u16, data: &[u8]) -> Result<Vec<u8>> {
+        let sector_size = data.len() as u16;
+        for attempt in 0..2 {
+            self.write_onboard_sector(sector_id, data)?;
+            let readback = self.read_onboard_sector(sector_id, sector_size)?;
+            if readback == data {
+                return Ok(readback);
+            }
+            if attempt == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+        }
+        Err(HidppError::InvalidArgument(format!(
+            "Onboard sector 0x{sector_id:04X} readback mismatch after write"
+        )))
+    }
+
     pub fn write_onboard_raw_sector(&self, sector_id: u16, data: &[u8]) -> Result<()> {
         if sector_id < 2 {
             return Err(HidppError::InvalidArgument(
                 "Refusing to write raw macro data into directory or primary profile sector".into(),
             ));
         }
-        if data.len() < 16 {
-            return Err(HidppError::InvalidArgument(format!(
-                "Sector data too short: {} bytes",
-                data.len()
-            )));
-        }
-        let [s_hi, s_lo] = sector_id.to_be_bytes();
-        let [c_hi, c_lo] = (data.len() as u16).to_be_bytes();
-        self.request_feature(
-            FeatureId::ONBOARD_PROFILES,
-            6,
-            &[s_hi, s_lo, 0x00, 0x00, c_hi, c_lo],
-        )?;
-        for chunk in data.chunks(16) {
-            if chunk.len() == 16 {
-                self.request_feature(FeatureId::ONBOARD_PROFILES, 7, chunk)?;
-            } else {
-                let mut padded = [0xFFu8; 16];
-                padded[..chunk.len()].copy_from_slice(chunk);
-                self.request_feature(FeatureId::ONBOARD_PROFILES, 7, &padded)?;
-            }
-        }
-        self.request_feature(FeatureId::ONBOARD_PROFILES, 8, &[])?;
-        Ok(())
+        self.write_onboard_sector(sector_id, data)
     }
 
     pub fn read_onboard_directory(&self) -> Result<Vec<ProfileDirectoryEntry>> {

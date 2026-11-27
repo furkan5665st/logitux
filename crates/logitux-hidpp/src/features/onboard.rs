@@ -157,14 +157,20 @@ pub fn encode_onboard_macro_bytes(ops: &[OnboardMacroOp], max_len: usize) -> Vec
 }
 
 pub fn build_macro_sector_image(stream: &[u8], sector_size: usize) -> Vec<u8> {
-    let mut buf = vec![0xFFu8; sector_size.max(16)];
-    let n = stream.len().min(buf.len());
+    let len = sector_size.max(16);
+    let payload_len = len - 2;
+    let mut buf = vec![0xFFu8; len];
+    let n = stream.len().min(payload_len);
     buf[..n].copy_from_slice(&stream[..n]);
-    if n < buf.len() {
+    if n < payload_len {
         buf[n] = 0xFF;
-    } else if let Some(last) = buf.last_mut() {
+    } else if let Some(last) = buf[..payload_len].last_mut() {
         *last = 0xFF;
     }
+    let crc = crc16_ccitt(&buf[..payload_len]);
+    let [hi, lo] = crc.to_be_bytes();
+    buf[len - 2] = hi;
+    buf[len - 1] = lo;
     buf
 }
 
@@ -586,7 +592,7 @@ mod tests {
                 key: 0x00,
             },
         ];
-        let stream = encode_onboard_macro_bytes(&ops, 255);
+        let stream = encode_onboard_macro_bytes(&ops, 253);
         assert_eq!(
             stream,
             vec![
@@ -597,6 +603,7 @@ mod tests {
         let img = build_macro_sector_image(&stream, 255);
         assert_eq!(img.len(), 255);
         assert_eq!(img[stream.len() - 1], 0xFF);
-        assert_eq!(img[254], 0xFF);
+        let stored_crc = u16::from_be_bytes([img[253], img[254]]);
+        assert_eq!(stored_crc, crc16_ccitt(&img[..253]));
     }
 }

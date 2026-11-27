@@ -135,8 +135,10 @@ pub enum HwEvent {
     },
     ButtonMask(u16),
     OnboardModeChanged(OnboardMode),
-    OnboardSaved {
-        ok: bool,
+    ProfileUpdated {
+        idx: usize,
+        profile: Box<OnboardProfile>,
+        summary: Box<DeviceSummary>,
     },
     StartupEffectChanged(usize, bool),
     Toast {
@@ -394,6 +396,10 @@ fn run_worker_loop(
                     if let Some(m) = devices.get_mut(selected_idx) {
                         match m.connected.device.set_rgb_effect(0, effect, persist) {
                             Ok(_) => {
+                                if m.connected.device.has_feature(FeatureId::ONBOARD_PROFILES) {
+                                    onboard_mode = OnboardMode::Host;
+                                    m.summary.onboard_mode = Some(OnboardMode::Host);
+                                }
                                 if let Some(p) = &mut m.profile {
                                     p.active_effect_0 = effect;
                                     p.active_effect_1 = effect;
@@ -774,7 +780,6 @@ fn commit_onboard_impl(
             let _ = m.connected.device.set_report_rate(active_prof.report_rate_hz);
         }
         let _ = m.connected.device.set_rgb_effect(0, eff, true);
-        let _ = evt_tx.send(HwEvent::OnboardSaved { ok: true });
         ctx.request_repaint();
         return true;
     }
@@ -784,7 +789,6 @@ fn commit_onboard_impl(
         m.profile = m.connected.device.read_onboard_profile(sec).ok();
     }
     let Some(hw_prof) = &mut m.profile else {
-        let _ = evt_tx.send(HwEvent::OnboardSaved { ok: false });
         let _ = evt_tx.send(HwEvent::Toast {
             msg: "Yerleşik profil sektörü okunamadı.".into(),
             is_err: true,
@@ -822,7 +826,7 @@ fn commit_onboard_impl(
         if let Some(ops) = compile_assignment_to_onboard_macro(item, macros, discord) {
             if next_macro_sector < sector_count && next_macro_sector <= 0xFF {
                 let page = next_macro_sector as u8;
-                let stream = encode_onboard_macro_bytes(&ops, sector_size);
+                let stream = encode_onboard_macro_bytes(&ops, sector_size.saturating_sub(2));
                 let sector_img = build_macro_sector_image(&stream, sector_size);
                 macro_writes.push((next_macro_sector, sector_img));
                 next_macro_sector += 1;
@@ -877,17 +881,21 @@ fn commit_onboard_impl(
         }
     }
 
+    let prev_mode = *onboard_mode;
+    let _ = m.connected.device.set_onboard_mode(OnboardMode::Host);
+
     for (sec_id, data) in macro_writes {
-        let mut wr = m.connected.device.write_onboard_raw_sector(sec_id, &data);
-        if wr.is_err() {
-            let _ = m.connected.device.set_onboard_mode(OnboardMode::Host);
-            wr = m.connected.device.write_onboard_raw_sector(sec_id, &data);
-        }
-        if let Err(e) = wr {
+        if let Err(e) = m
+            .connected
+            .device
+            .write_onboard_sector_verified(sec_id, &data)
+        {
             if is_connection_error(&e) {
                 *rescan_requested = true;
             }
-            let _ = evt_tx.send(HwEvent::OnboardSaved { ok: false });
+            if prev_mode == OnboardMode::Onboard {
+                let _ = m.connected.device.set_onboard_mode(OnboardMode::Onboard);
+            }
             let _ = evt_tx.send(HwEvent::Toast {
                 msg: format!("Makro bellek yazma hatası (sektör {sec_id}): {e}"),
                 is_err: true,
@@ -899,16 +907,26 @@ fn commit_onboard_impl(
 
     let sec = m.active_sector;
     let active_dpi_idx = active_idx as u8;
-    let mut write_res = m.connected.device.write_onboard_sector(sec, &encoded);
-    if write_res.is_err() {
-        let _ = m.connected.device.set_onboard_mode(OnboardMode::Host);
-        write_res = m.connected.device.write_onboard_sector(sec, &encoded);
-    }
+    let btn_count = m
+        .summary
+        .onboard
+        .as_ref()
+        .map(|d| d.button_count as usize)
+        .unwrap_or(6);
+    let write_res = m
+        .connected
+        .device
+        .write_onboard_sector_verified(sec, &encoded);
 
     match write_res {
-        Ok(_) => {
+        Ok(verified_raw) => {
             m.connected.device.ensure_rgb_powered();
-            if activate_onboard {
+            let target_mode = if activate_onboard || prev_mode == OnboardMode::Onboard {
+                OnboardMode::Onboard
+            } else {
+                prev_mode
+            };
+            if target_mode == OnboardMode::Onboard {
                 if m.connected.device.set_onboard_mode(OnboardMode::Onboard).is_ok() {
                     *onboard_mode = OnboardMode::Onboard;
                     m.summary.onboard_mode = Some(OnboardMode::Onboard);
@@ -916,17 +934,34 @@ fn commit_onboard_impl(
                 }
                 let _ = m.connected.device.set_active_onboard_profile(sec);
                 let _ = m.connected.device.set_active_onboard_dpi_index(active_dpi_idx);
-            } else if *onboard_mode == OnboardMode::Onboard {
-                let _ = m.connected.device.set_active_onboard_profile(sec);
-                let _ = m.connected.device.set_active_onboard_dpi_index(active_dpi_idx);
+            } else {
+                *onboard_mode = target_mode;
+                m.summary.onboard_mode = Some(target_mode);
             }
-            if let Ok(reloaded) = m.connected.device.read_onboard_profile(sec) {
-                m.profile = Some(reloaded);
+            if let Ok(reloaded) = OnboardProfile::parse(sec, &verified_raw, btn_count) {
+                if let Some(dpis) = &mut m.summary.dpi {
+                    if let Some(s0) = dpis.first_mut() {
+                        let d = reloaded.dpi_stages[active_idx.min(4)];
+                        if d > 0 {
+                            s0.current_dpi = d;
+                        }
+                    }
+                }
+                if let Some(rr) = &mut m.summary.report_rate {
+                    if reloaded.report_rate_ms > 0 {
+                        rr.current_hz = 1000 / (reloaded.report_rate_ms as u16);
+                    }
+                }
+                m.profile = Some(reloaded.clone());
+                let _ = evt_tx.send(HwEvent::ProfileUpdated {
+                    idx: selected_idx,
+                    profile: Box::new(reloaded),
+                    summary: Box::new(m.summary.clone()),
+                });
             }
-            let _ = evt_tx.send(HwEvent::OnboardSaved { ok: true });
             if notify_toast {
                 let _ = evt_tx.send(HwEvent::Toast {
-                    msg: "Ayarlar farenin dahili belleğine kaydedildi (program kapalıyken de çalışır).".into(),
+                    msg: "Ayarlar farenin dahili belleğine kaydedildi.".into(),
                     is_err: false,
                 });
             }
@@ -937,7 +972,9 @@ fn commit_onboard_impl(
             if is_connection_error(&e) {
                 *rescan_requested = true;
             }
-            let _ = evt_tx.send(HwEvent::OnboardSaved { ok: false });
+            if prev_mode == OnboardMode::Onboard {
+                let _ = m.connected.device.set_onboard_mode(OnboardMode::Onboard);
+            }
             let _ = evt_tx.send(HwEvent::Toast {
                 msg: format!("Bellek yazma hatası: {e}"),
                 is_err: true,
