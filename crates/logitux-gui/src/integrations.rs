@@ -28,27 +28,46 @@ fn open_discord_ipc() -> Option<std::fs::File> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn open_discord_ipc() -> Option<std::os::unix::net::UnixStream> {
+fn discord_ipc_paths() -> Vec<std::path::PathBuf> {
     use std::env;
-    use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
 
     let mut bases = Vec::new();
     if let Ok(xdg) = env::var("XDG_RUNTIME_DIR") {
-        bases.push(PathBuf::from(&xdg));
-        bases.push(PathBuf::from(&xdg).join("app/com.discordapp.Discord"));
-        bases.push(PathBuf::from(&xdg).join("snap.discord"));
+        let p = PathBuf::from(&xdg);
+        bases.push(p.clone());
+        bases.push(p.join("app/com.discordapp.Discord"));
+        bases.push(p.join("app/com.discordapp.DiscordCanary"));
+        bases.push(p.join("app/com.discordapp.DiscordPTB"));
+        bases.push(p.join("app/dev.vencord.Vesktop"));
+        bases.push(p.join("app/org.equicord.Equibop"));
+        bases.push(p.join("snap.discord"));
+    }
+    if let Ok(tmp) = env::var("TMPDIR") {
+        if !tmp.is_empty() {
+            bases.push(PathBuf::from(tmp));
+        }
     }
     bases.push(PathBuf::from("/tmp"));
 
+    let mut paths = Vec::new();
     for base in bases {
         for i in 0..10 {
-            let p = base.join(format!("discord-ipc-{i}"));
-            if let Ok(s) = UnixStream::connect(&p) {
-                let _ = s.set_read_timeout(Some(Duration::from_millis(1800)));
-                let _ = s.set_write_timeout(Some(Duration::from_millis(1200)));
-                return Some(s);
-            }
+            paths.push(base.join(format!("discord-ipc-{i}")));
+        }
+    }
+    paths
+}
+
+#[cfg(not(target_os = "windows"))]
+fn open_discord_ipc() -> Option<std::os::unix::net::UnixStream> {
+    use std::os::unix::net::UnixStream;
+
+    for p in discord_ipc_paths() {
+        if let Ok(s) = UnixStream::connect(&p) {
+            let _ = s.set_read_timeout(Some(Duration::from_millis(1800)));
+            let _ = s.set_write_timeout(Some(Duration::from_millis(1200)));
+            return Some(s);
         }
     }
     None
@@ -67,7 +86,9 @@ pub fn is_discord_detected() -> bool {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        open_discord_ipc().is_some()
+        discord_ipc_paths()
+            .into_iter()
+            .any(|p| std::fs::metadata(&p).is_ok())
     }
 }
 

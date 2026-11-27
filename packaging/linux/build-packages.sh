@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
-VERSION="0.4.0"
+VERSION="0.4.1"
 
 echo "==> [1/6] Tests"
 cargo test --workspace
@@ -12,11 +12,12 @@ cargo test --workspace
 echo "==> [2/6] Build"
 cargo build --release --workspace
 strip target/release/logitux-gui target/release/logitux
+ldd target/release/logitux-gui || true
 
 rm -rf dist AppDir deb_pkg rpmbuild "LogiTux-${VERSION}-linux-x86_64"
 mkdir -p dist
 
-echo "==> [3/6] AppImage"
+echo "==> [3/6] AppImage (static type2-runtime, no libfuse2 required)"
 mkdir -p \
   AppDir/usr/bin \
   AppDir/usr/lib/udev/rules.d \
@@ -47,7 +48,7 @@ cat > AppDir/AppRun << 'EOF'
 HERE="$(dirname "$(readlink -f "${0}")")"
 export PATH="${HERE}/usr/bin:${PATH}"
 if [ "${1:-}" = "--install-udev" ]; then
-  CMD="rm -f /etc/udev/rules.d/99-logitux.rules && cp '${HERE}/usr/lib/udev/rules.d/60-logitux.rules' /etc/udev/rules.d/60-logitux.rules && udevadm control --reload-rules && udevadm trigger --subsystem-match=hidraw --action=change"
+  CMD="rm -f /etc/udev/rules.d/99-logitux.rules && cp '${HERE}/usr/lib/udev/rules.d/60-logitux.rules' /etc/udev/rules.d/60-logitux.rules && udevadm control --reload-rules && udevadm trigger --subsystem-match=hidraw --action=change && udevadm trigger --subsystem-match=misc --sysname-match=uinput --action=change"
   if command -v pkexec >/dev/null 2>&1; then
     pkexec sh -c "$CMD"
   else
@@ -59,7 +60,15 @@ if [ "${1:-}" = "--cli" ]; then
   shift
   exec "${HERE}/usr/bin/logitux" "$@"
 fi
-exec "${HERE}/usr/bin/logitux-gui" "$@"
+if [ -n "${WAYLAND_DISPLAY:-}" ] && [ -e /proc/driver/nvidia/version ] && [ -z "${__NV_DISABLE_EXPLICIT_SYNC:-}" ]; then
+  export __NV_DISABLE_EXPLICIT_SYNC=1
+fi
+"${HERE}/usr/bin/logitux-gui" "$@"
+RC=$?
+if [ "$RC" -ne 0 ] && [ -n "${WAYLAND_DISPLAY:-}" ] && [ -n "${DISPLAY:-}" ]; then
+  WAYLAND_DISPLAY="" exec "${HERE}/usr/bin/logitux-gui" "$@"
+fi
+exit "$RC"
 EOF
 chmod +x AppDir/AppRun
 
@@ -67,7 +76,10 @@ if [ ! -f appimagetool-x86_64.AppImage ]; then
   wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
   chmod +x appimagetool-x86_64.AppImage
 fi
-ARCH=x86_64 ./appimagetool-x86_64.AppImage --appimage-extract-and-run AppDir "dist/LogiTux-${VERSION}-x86_64.AppImage"
+if [ ! -f runtime-x86_64 ]; then
+  wget -q https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64
+fi
+ARCH=x86_64 ./appimagetool-x86_64.AppImage --appimage-extract-and-run --comp zstd --runtime-file ./runtime-x86_64 AppDir "dist/LogiTux-${VERSION}-x86_64.AppImage"
 chmod +x "dist/LogiTux-${VERSION}-x86_64.AppImage"
 
 echo "==> [4/6] deb"
@@ -92,6 +104,7 @@ Section: utils
 Priority: optional
 Architecture: amd64
 Depends: libc6
+Recommends: libgl1, libxkbcommon0, libwayland-client0, libx11-6
 Maintainer: LogiTux Contributors
 Description: Logitech mouse configuration tool
  Configure DPI stages, polling rate, LIGHTSYNC RGB, macros, and hardware
@@ -101,10 +114,17 @@ EOF
 cat > "$DEB_DIR/DEBIAN/postinst" << 'EOF'
 #!/bin/sh
 set -e
-rm -f /etc/udev/rules.d/99-logitux.rules /lib/udev/rules.d/99-logitux.rules || true
+rm -f /etc/udev/rules.d/99-logitux.rules /lib/udev/rules.d/99-logitux.rules /usr/lib/udev/rules.d/99-logitux.rules || true
 if command -v udevadm >/dev/null 2>&1; then
   udevadm control --reload-rules || true
   udevadm trigger --subsystem-match=hidraw --action=change || true
+  udevadm trigger --subsystem-match=misc --sysname-match=uinput --action=change || true
+fi
+if command -v update-desktop-database >/dev/null 2>&1; then
+  update-desktop-database /usr/share/applications || true
+fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+  gtk-update-icon-cache -f -t /usr/share/icons/hicolor || true
 fi
 EOF
 chmod 755 "$DEB_DIR/DEBIAN/postinst"
@@ -138,6 +158,13 @@ rm -f /etc/udev/rules.d/99-logitux.rules /usr/lib/udev/rules.d/99-logitux.rules 
 if command -v udevadm >/dev/null 2>&1; then
   udevadm control --reload-rules || true
   udevadm trigger --subsystem-match=hidraw --action=change || true
+  udevadm trigger --subsystem-match=misc --sysname-match=uinput --action=change || true
+fi
+if command -v update-desktop-database >/dev/null 2>&1; then
+  update-desktop-database /usr/share/applications || true
+fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+  gtk-update-icon-cache -f -t /usr/share/icons/hicolor || true
 fi
 
 %files

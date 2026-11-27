@@ -2,16 +2,29 @@ use logitux_hidpp::{HidppPacket, REPORT_LONG, REPORT_SHORT, REPORT_VERY_LONG};
 use serde::{Deserialize, Serialize};
 
 pub const LOGITECH_VID: u16 = 0x046D;
+pub const LENOVO_VID: u16 = 0x17EF;
+pub const LENOVO_NANO_PID: u16 = 0x6042;
 
 pub const UDEV_RULES_FILENAME: &str = "60-logitux.rules";
 pub const UDEV_RULES_CONTENT: &str = concat!(
-    "ACTION==\"add|change\", SUBSYSTEM==\"hidraw\", ATTRS{idVendor}==\"046d\", MODE=\"0666\", TAG+=\"uaccess\"\n",
-    "ACTION==\"add|change\", SUBSYSTEM==\"hidraw\", ATTRS{idVendor}==\"046D\", MODE=\"0666\", TAG+=\"uaccess\"\n",
-    "ACTION==\"add|change\", SUBSYSTEM==\"hidraw\", KERNELS==\"*:046D:*\", MODE=\"0666\", TAG+=\"uaccess\"\n",
-    "ACTION==\"add|change\", SUBSYSTEM==\"hidraw\", KERNELS==\"*:046d:*\", MODE=\"0666\", TAG+=\"uaccess\"\n",
-    "ACTION==\"add|change\", SUBSYSTEM==\"hidraw\", DRIVERS==\"logitech-hidpp-device|logitech-djdevice|logitech-djreceiver\", MODE=\"0666\", TAG+=\"uaccess\"\n",
     "KERNEL==\"uinput\", SUBSYSTEM==\"misc\", OPTIONS+=\"static_node=uinput\", MODE=\"0666\", TAG+=\"uaccess\"\n",
+    "ACTION==\"remove\", GOTO=\"logitux_end\"\n",
+    "SUBSYSTEM!=\"hidraw\", GOTO=\"logitux_end\"\n",
+    "ATTRS{idVendor}==\"046d\", GOTO=\"logitux_apply\"\n",
+    "ATTRS{idVendor}==\"046D\", GOTO=\"logitux_apply\"\n",
+    "ATTRS{idVendor}==\"17ef\", ATTRS{idProduct}==\"6042\", GOTO=\"logitux_apply\"\n",
+    "KERNELS==\"*:046D:*\", GOTO=\"logitux_apply\"\n",
+    "KERNELS==\"*:046d:*\", GOTO=\"logitux_apply\"\n",
+    "DRIVERS==\"logitech-hidpp-device|logitech-djdevice|logitech-djreceiver\", GOTO=\"logitux_apply\"\n",
+    "GOTO=\"logitux_end\"\n",
+    "LABEL=\"logitux_apply\"\n",
+    "MODE=\"0666\", TAG+=\"uaccess\"\n",
+    "LABEL=\"logitux_end\"\n",
 );
+
+pub fn is_supported_vendor_product(vid: u16, pid: u16) -> bool {
+    vid == LOGITECH_VID || (vid == LENOVO_VID && pid == LENOVO_NANO_PID)
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HidrawUevent {
@@ -115,11 +128,8 @@ pub fn inspect_report_descriptor(desc: &[u8]) -> HidppReportCaps {
             if page == 0xFF00 {
                 caps.has_vendor_ff00 = true;
             }
-        } else if tag_type == 0x84 && data.len() == 1 {
+        } else if tag_type == 0x84 && data.len() == 1 && in_vendor_page {
             match data[0] {
-                REPORT_SHORT if in_vendor_page => caps.has_short = true,
-                REPORT_LONG if in_vendor_page => caps.has_long = true,
-                REPORT_VERY_LONG if in_vendor_page => caps.has_very_long = true,
                 REPORT_SHORT => caps.has_short = true,
                 REPORT_LONG => caps.has_long = true,
                 REPORT_VERY_LONG => caps.has_very_long = true,
@@ -142,23 +152,45 @@ pub fn try_parse_hidpp_frame(raw: &[u8]) -> Option<HidppPacket> {
     HidppPacket::from_raw(raw).ok()
 }
 
+pub fn build_manual_access_command(persistent_rule: bool) -> String {
+    if persistent_rule {
+        format!(
+            "sudo sh -c 'rm -f /etc/udev/rules.d/99-logitux.rules; \
+             printf \"%s\" \"{}\" > /etc/udev/rules.d/{UDEV_RULES_FILENAME}; \
+             udevadm control --reload-rules && udevadm trigger --subsystem-match=hidraw --action=change; \
+             for d in /sys/class/hidraw/hidraw*; do grep -qiE \"HID_ID=[0-9a-f]+:(0*046d:|0*17ef:0*6042)\" \"$d/device/uevent\" 2>/dev/null && chmod 0666 \"/dev/$(basename \"$d\")\"; done; \
+             [ -e /dev/uinput ] && chmod 0666 /dev/uinput || true'",
+            UDEV_RULES_CONTENT
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+        )
+    } else {
+        "sudo sh -c 'for d in /sys/class/hidraw/hidraw*; do grep -qiE \"HID_ID=[0-9a-f]+:(0*046d:|0*17ef:0*6042)\" \"$d/device/uevent\" 2>/dev/null && chmod 0666 \"/dev/$(basename \"$d\")\"; done; [ -e /dev/uinput ] && chmod 0666 /dev/uinput || true'".to_string()
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub mod imp {
     use std::collections::HashSet;
     use std::fs::{self, File, OpenOptions};
     use std::io::{ErrorKind, Write};
+    use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
     use std::path::Path;
     use std::process::Command;
     use std::time::{Duration, Instant};
 
-    use logitux_hidpp::{HidppDevice, HidppError, HidppPacket, Result, Transport, DEVICE_INDEX_WIRED};
+    use logitux_hidpp::{
+        HidppDevice, HidppError, HidppPacket, Result, Transport, DEVICE_INDEX_WIRED,
+    };
 
     use crate::{is_receiver_pid, ConnectedDevice, ConnectionReport, DiscoveredHidppDevice};
 
     use super::{
-        inspect_report_descriptor, parse_hidraw_uevent, try_parse_hidpp_frame, BlockedHidDevice,
-        HidppReportCaps, LOGITECH_VID, UDEV_RULES_CONTENT, UDEV_RULES_FILENAME,
+        inspect_report_descriptor, is_supported_vendor_product, parse_hidraw_uevent,
+        try_parse_hidpp_frame, BlockedHidDevice, HidppReportCaps, UDEV_RULES_CONTENT,
+        UDEV_RULES_FILENAME,
     };
 
     pub struct LinuxHidrawTransport {
@@ -174,7 +206,23 @@ pub mod imp {
             device_index: u8,
             caps: HidppReportCaps,
         ) -> std::result::Result<Self, std::io::Error> {
-            let file = OpenOptions::new().read(true).write(true).open(path)?;
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+                .open(path)?;
+
+            let fd = file.as_raw_fd();
+            let mut drain = [0u8; 64];
+            for _ in 0..16 {
+                let n = unsafe {
+                    libc::read(fd, drain.as_mut_ptr() as *mut libc::c_void, drain.len())
+                };
+                if n <= 0 {
+                    break;
+                }
+            }
+
             let supports_short = caps.has_short || !caps.has_long;
             let supports_long = caps.has_long || !caps.has_short;
             Ok(Self {
@@ -189,9 +237,26 @@ pub mod imp {
     impl Transport for LinuxHidrawTransport {
         fn write_packet(&self, packet: &HidppPacket) -> Result<()> {
             let mut f = &self.file;
-            f.write_all(packet.as_bytes())
-                .map_err(|e| HidppError::Transport(format!("hidraw write failed: {e}")))?;
-            Ok(())
+            let data = packet.as_bytes();
+            let deadline = Instant::now() + Duration::from_millis(250);
+            loop {
+                match f.write_all(data) {
+                    Ok(()) => return Ok(()),
+                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return Err(HidppError::Timeout);
+                        }
+                        let mut pfd = libc::pollfd {
+                            fd: self.file.as_raw_fd(),
+                            events: libc::POLLOUT,
+                            revents: 0,
+                        };
+                        let _ = unsafe { libc::poll(&mut pfd, 1, 20) };
+                    }
+                    Err(e) => return Err(HidppError::Transport(format!("hidraw write failed: {e}"))),
+                }
+            }
         }
 
         fn read_packet(&self, timeout_ms: u32) -> Result<Option<HidppPacket>> {
@@ -230,11 +295,17 @@ pub mod imp {
                     return Err(HidppError::Transport("HID device disconnected".into()));
                 }
                 if (pfd.revents & libc::POLLIN) != 0 {
-                    let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+                    let n = unsafe {
+                        libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                    };
                     if n < 0 {
                         let err = std::io::Error::last_os_error();
-                        if err.kind() == ErrorKind::Interrupted || err.kind() == ErrorKind::WouldBlock
+                        if err.kind() == ErrorKind::Interrupted
+                            || err.kind() == ErrorKind::WouldBlock
                         {
+                            if Instant::now() >= deadline {
+                                return Ok(None);
+                            }
                             continue;
                         }
                         return Err(HidppError::Transport(format!("hidraw read failed: {err}")));
@@ -270,11 +341,13 @@ pub mod imp {
         path: String,
         caps: HidppReportCaps,
         phys: String,
+        is_dj_child: bool,
     }
 
     fn read_interface_number(sys_dev: &Path) -> i32 {
-        let mut cur = Some(sys_dev);
-        for _ in 0..4 {
+        let resolved = fs::canonicalize(sys_dev).unwrap_or_else(|_| sys_dev.to_path_buf());
+        let mut cur = Some(resolved.as_path());
+        for _ in 0..5 {
             let Some(p) = cur else { break };
             let iface_file = p.join("bInterfaceNumber");
             if let Ok(txt) = fs::read_to_string(&iface_file) {
@@ -305,7 +378,7 @@ pub mod imp {
             let Some(uev) = parse_hidraw_uevent(&uevent_txt) else {
                 continue;
             };
-            if uev.vendor_id != LOGITECH_VID {
+            if !is_supported_vendor_product(uev.vendor_id, uev.product_id) {
                 continue;
             }
 
@@ -319,9 +392,11 @@ pub mod imp {
             } else {
                 uev.name.clone()
             };
+            let is_dj_child = uev.driver == "logitech-hidpp-device"
+                || uev.driver == "logitech-djdevice";
 
             let desc = DiscoveredHidppDevice {
-                vendor_id: LOGITECH_VID,
+                vendor_id: uev.vendor_id,
                 product_id: uev.product_id,
                 product_name: name,
                 manufacturer: "Logitech".to_string(),
@@ -331,7 +406,7 @@ pub mod imp {
                     uev.uniq.clone()
                 },
                 interface_number: iface,
-                is_receiver: is_receiver_pid(uev.product_id),
+                is_receiver: !is_dj_child && is_receiver_pid(uev.product_id),
                 short_path: caps.has_short.then(|| dev_path.clone()),
                 long_path: caps.has_long.then(|| dev_path.clone()),
                 very_long_path: caps.has_very_long.then(|| dev_path.clone()),
@@ -343,11 +418,13 @@ pub mod imp {
                 path: dev_path,
                 caps,
                 phys: uev.phys,
+                is_dj_child,
             });
         }
 
         out.sort_by_key(|c| {
             (
+                c.desc.is_receiver,
                 !c.caps.has_vendor_ff00,
                 !(c.caps.has_long || c.caps.has_short),
                 c.path.clone(),
@@ -361,7 +438,11 @@ pub mod imp {
         let has_explicit_hidpp = cands.iter().any(|c| c.caps.looks_hidpp());
         let mut out = Vec::new();
         for c in cands {
-            if !has_explicit_hidpp || c.caps.looks_hidpp() || c.desc.interface_number >= 1 {
+            if !has_explicit_hidpp
+                || c.caps.looks_hidpp()
+                || c.is_dj_child
+                || c.desc.interface_number >= 1
+            {
                 out.push(c.desc);
             }
         }
@@ -373,17 +454,22 @@ pub mod imp {
         let any_explicit_hidpp = candidates.iter().any(|c| c.caps.looks_hidpp());
         let mut connected = Vec::new();
         let mut blocked = Vec::new();
-        let mut seen_devices: HashSet<(u16, String, u8)> = HashSet::new();
+        let mut seen_unit_ids: HashSet<String> = HashSet::new();
+        let mut seen_fallback: HashSet<(u16, String, u8)> = HashSet::new();
 
         for cand in candidates {
-            let prefer_hidpp =
-                !any_explicit_hidpp || cand.caps.looks_hidpp() || cand.desc.interface_number != 0;
+            let prefer_hidpp = !any_explicit_hidpp
+                || cand.caps.looks_hidpp()
+                || cand.is_dj_child
+                || cand.desc.interface_number != 0;
             if !prefer_hidpp {
                 continue;
             }
 
             let indices: Vec<u8> = if cand.desc.is_receiver {
                 vec![1, 2, 3, 4, 5, 6, DEVICE_INDEX_WIRED]
+            } else if cand.is_dj_child {
+                vec![DEVICE_INDEX_WIRED, 1, 2, 3, 4, 5, 6]
             } else {
                 vec![DEVICE_INDEX_WIRED, 1]
             };
@@ -393,21 +479,33 @@ pub mod imp {
                 match LinuxHidrawTransport::open(&cand.path, dev_idx, cand.caps) {
                     Ok(transport) => {
                         if let Ok(device) = HidppDevice::connect(transport) {
-                            let uniq_key = if !cand.desc.serial_number.is_empty() {
-                                cand.desc.serial_number.clone()
-                            } else if !cand.phys.is_empty() {
-                                cand.phys.clone()
+                            let unit_dedup = device
+                                .firmware_info()
+                                .ok()
+                                .map(|fw| format!("{}:{}", fw.unit_id_hex(), fw.model_id_hex()))
+                                .filter(|s| !s.starts_with("00000000:"));
+
+                            let is_new = if let Some(uk) = unit_dedup {
+                                seen_unit_ids.insert(uk)
                             } else {
-                                cand.path.clone()
+                                let uniq_key = if !cand.desc.serial_number.is_empty() {
+                                    cand.desc.serial_number.clone()
+                                } else if !cand.phys.is_empty() {
+                                    cand.phys.clone()
+                                } else {
+                                    cand.path.clone()
+                                };
+                                seen_fallback.insert((cand.desc.product_id, uniq_key, dev_idx))
                             };
-                            if seen_devices.insert((cand.desc.product_id, uniq_key, dev_idx)) {
+
+                            if is_new {
                                 connected.push(ConnectedDevice {
                                     descriptor: cand.desc.clone(),
                                     device,
                                 });
-                                if !cand.desc.is_receiver {
-                                    break;
-                                }
+                            }
+                            if !cand.desc.is_receiver {
+                                break;
                             }
                         }
                     }
@@ -436,12 +534,15 @@ pub mod imp {
         })
     }
 
-    pub fn grant_linux_hidraw_access(install_persistent_rule: bool) -> std::result::Result<String, String> {
+    pub fn grant_linux_hidraw_access(
+        install_persistent_rule: bool,
+        allow_terminal_fallback: bool,
+    ) -> std::result::Result<String, String> {
         let uid = unsafe { libc::geteuid() };
         let grant_live = format!(
             "for d in /sys/class/hidraw/hidraw*; do \
                [ -r \"$d/device/uevent\" ] || continue; \
-               if grep -qiE 'HID_ID=[0-9a-f]+:0*046d:' \"$d/device/uevent\"; then \
+               if grep -qiE 'HID_ID=[0-9a-f]+:(0*046d:|0*17ef:0*6042)' \"$d/device/uevent\"; then \
                  dev=\"/dev/$(basename \"$d\")\"; \
                  [ -e \"$dev\" ] || continue; \
                  if command -v setfacl >/dev/null 2>&1; then \
@@ -450,7 +551,14 @@ pub mod imp {
                    chmod 0666 \"$dev\" 2>/dev/null || true; \
                  fi; \
                fi; \
-             done"
+             done; \
+             if [ -e /dev/uinput ]; then \
+               if command -v setfacl >/dev/null 2>&1; then \
+                 setfacl -m u:{uid}:rw /dev/uinput 2>/dev/null || chmod 0666 /dev/uinput 2>/dev/null || true; \
+               else \
+                 chmod 0666 /dev/uinput 2>/dev/null || true; \
+               fi; \
+             fi"
         );
 
         let script = if install_persistent_rule {
@@ -470,6 +578,7 @@ LOGITUX_EOF\n\
                    if command -v udevadm >/dev/null 2>&1; then \
                      udevadm control --reload-rules 2>/dev/null || true; \
                      udevadm trigger --subsystem-match=hidraw --action=change 2>/dev/null || true; \
+                     udevadm trigger --subsystem-match=misc --sysname-match=uinput --action=change 2>/dev/null || true; \
                    fi; \
                  fi; \
                  {grant_live}"
@@ -478,40 +587,131 @@ LOGITUX_EOF\n\
             grant_live
         };
 
+        if uid == 0 {
+            return match Command::new("sh").arg("-c").arg(&script).status() {
+                Ok(s) if s.success() => Ok("Linux HID erişimi etkinleştirildi.".into()),
+                Ok(s) => Err(format!("Yetkilendirme başarısız oldu (kod: {:?}).", s.code())),
+                Err(e) => Err(format!("Yetkilendirme başlatılamadı: {e}")),
+            };
+        }
+
+        if command_exists("sudo")
+            && Command::new("sudo")
+                .args(["-n", "sh", "-c", &script])
+                .status()
+                .is_ok_and(|s| s.success())
+        {
+            return Ok("Linux HID erişimi etkinleştirildi.".into());
+        }
+
         let has_gui_session = std::env::var_os("DISPLAY").is_some()
             || std::env::var_os("WAYLAND_DISPLAY").is_some();
 
-        let status = if uid == 0 {
-            Command::new("sh").arg("-c").arg(&script).status()
-        } else if has_gui_session && command_exists("pkexec") {
-            Command::new("pkexec")
-                .args(["sh", "-c", &script])
-                .status()
-        } else if has_gui_session && command_exists("kdesu") {
-            Command::new("kdesu")
-                .args(["-c", &format!("sh -c '{}'", script.replace('\'', "'\"'\"'"))])
-                .status()
-        } else if command_exists("sudo") {
-            Command::new("sudo").args(["sh", "-c", &script]).status()
-        } else if command_exists("pkexec") {
-            Command::new("pkexec")
-                .args(["sh", "-c", &script])
-                .status()
-        } else {
-            return Err("pkexec / sudo bulunamadı".into());
-        };
+        let mut last_err = String::new();
 
-        match status {
-            Ok(s) if s.success() => Ok("Linux HID erişimi etkinleştirildi.".into()),
-            Ok(s) => Err(format!(
-                "Yetkilendirme iptal edildi veya başarısız oldu (kod: {:?}).",
-                s.code()
-            )),
-            Err(e) => Err(format!("Yetkilendirme başlatılamadı: {e}")),
+        if has_gui_session && command_exists("pkexec") {
+            match Command::new("pkexec").args(["sh", "-c", &script]).output() {
+                Ok(out) if out.status.success() => {
+                    return Ok("Linux HID erişimi etkinleştirildi.".into());
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr).to_lowercase();
+                    let code = out.status.code().unwrap_or(-1);
+                    if code == 126 && !stderr.contains("agent") {
+                        return Err("Yetkilendirme kullanıcı tarafından iptal edildi.".into());
+                    }
+                    last_err = format!("pkexec: {} (kod {code})", stderr.trim());
+                }
+                Err(e) => {
+                    last_err = format!("pkexec hatası: {e}");
+                }
+            }
+        }
+
+        if has_gui_session {
+            for kdesu_bin in [
+                "kdesu",
+                "/usr/libexec/kf6/kdesu",
+                "/usr/lib/kf6/kdesu",
+                "/usr/libexec/kf5/kdesu",
+                "/usr/lib/kf5/kdesu",
+                "/usr/lib/x86_64-linux-gnu/libexec/kf5/kdesu",
+                "lxqt-sudo",
+            ] {
+                if command_exists(kdesu_bin) {
+                    let arg = format!("sh -c '{}'", script.replace('\'', "'\"'\"'"));
+                    let res = if kdesu_bin.ends_with("lxqt-sudo") {
+                        Command::new(kdesu_bin).args(["sh", "-c", &script]).status()
+                    } else {
+                        Command::new(kdesu_bin).args(["-c", &arg]).status()
+                    };
+                    if let Ok(s) = res {
+                        if s.success() {
+                            return Ok("Linux HID erişimi etkinleştirildi.".into());
+                        }
+                    }
+                }
+            }
+        }
+
+        if !has_gui_session && command_exists("sudo") {
+            if Command::new("sudo")
+                .args(["sh", "-c", &script])
+                .status()
+                .is_ok_and(|s| s.success())
+            {
+                return Ok("Linux HID erişimi etkinleştirildi.".into());
+            }
+        }
+
+        if allow_terminal_fallback && has_gui_session && command_exists("sudo") {
+            let tmp_script = format!("/tmp/logitux-grant-{uid}.sh");
+            if fs::write(&tmp_script, format!("#!/bin/sh\n{script}\n")).is_ok() {
+                let run_cmd = format!(
+                    "sudo sh '{tmp_script}'; rm -f '{tmp_script}'; echo; echo 'Tamamlandı. Pencere kapanıyor...'; sleep 1"
+                );
+                let terminals: &[(&str, &[&str])] = &[
+                    ("konsole", &["-e", "sh", "-c"]),
+                    ("gnome-terminal", &["--", "sh", "-c"]),
+                    ("xfce4-terminal", &["-e", "sh -c"]),
+                    ("kitty", &["sh", "-c"]),
+                    ("alacritty", &["-e", "sh", "-c"]),
+                    ("foot", &["sh", "-c"]),
+                    ("wezterm", &["start", "--", "sh", "-c"]),
+                    ("xterm", &["-e", "sh", "-c"]),
+                    ("x-terminal-emulator", &["-e", "sh", "-c"]),
+                ];
+                for &(term, args) in terminals {
+                    if command_exists(term) {
+                        let mut cmd = Command::new(term);
+                        if term == "xfce4-terminal" {
+                            cmd.args(["-x", "sh", "-c", &run_cmd]);
+                        } else {
+                            cmd.args(args).arg(&run_cmd);
+                        }
+                        if cmd.status().is_ok_and(|s| s.success()) {
+                            let _ = fs::remove_file(&tmp_script);
+                            return Ok("Linux HID erişimi etkinleştirildi.".into());
+                        }
+                    }
+                }
+                let _ = fs::remove_file(&tmp_script);
+            }
+        }
+
+        if last_err.is_empty() {
+            Err("Grafik yetkilendirme aracısı (polkit) bulunamadı. Aşağıdaki komutu terminalde çalıştırın.".into())
+        } else {
+            Err(format!(
+                "Otomatik yetkilendirme başarısız ({last_err}). Aşağıdaki komutu terminalde çalıştırabilirsiniz."
+            ))
         }
     }
 
     fn command_exists(name: &str) -> bool {
+        if name.starts_with('/') {
+            return Path::new(name).is_file();
+        }
         Command::new("sh")
             .args(["-c", &format!("command -v {name} >/dev/null 2>&1")])
             .status()
@@ -538,12 +738,14 @@ HID_UNIQ=206B3766424D
         assert_eq!(u.product_id, 0xC092);
         assert_eq!(u.name, "Logitech G102 LIGHTSYNC Gaming Mouse");
         assert_eq!(u.uniq, "206B3766424D");
+        assert!(is_supported_vendor_product(u.vendor_id, u.product_id));
 
         let bt = "HID_ID=0005:0000046D:0000B034\nHID_NAME=MX Master 3S\n";
         let ub = parse_hidraw_uevent(bt).unwrap();
         assert_eq!(ub.bus, 0x0005);
         assert_eq!(ub.vendor_id, 0x046D);
         assert_eq!(ub.product_id, 0xB034);
+        assert!(is_supported_vendor_product(LENOVO_VID, LENOVO_NANO_PID));
     }
 
     #[test]
@@ -560,7 +762,7 @@ HID_UNIQ=206B3766424D
         assert!(!caps.has_very_long);
         assert!(caps.looks_hidpp());
 
-        let mouse_only = [0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x01, 0xC0];
+        let mouse_only = [0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x85, 0x10, 0xC0];
         let mc = inspect_report_descriptor(&mouse_only);
         assert!(!mc.looks_hidpp());
     }

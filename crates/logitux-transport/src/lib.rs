@@ -4,7 +4,8 @@ use logitux_hidpp::{HidppDevice, Result};
 use serde::{Deserialize, Serialize};
 
 pub use linux_hidraw::{
-    BlockedHidDevice, LOGITECH_VID, UDEV_RULES_CONTENT, UDEV_RULES_FILENAME,
+    build_manual_access_command, BlockedHidDevice, LOGITECH_VID, UDEV_RULES_CONTENT,
+    UDEV_RULES_FILENAME,
 };
 
 pub const HIDPP_USAGE_PAGE: u16 = 0xFF00;
@@ -92,14 +93,20 @@ pub fn connect_all_devices() -> Result<Vec<ConnectedDevice>> {
     Ok(connect_all_devices_diagnosed()?.devices)
 }
 
-pub fn grant_linux_hidraw_access(install_persistent_rule: bool) -> std::result::Result<String, String> {
+pub fn grant_linux_hidraw_access(
+    install_persistent_rule: bool,
+    allow_terminal_fallback: bool,
+) -> std::result::Result<String, String> {
     #[cfg(target_os = "linux")]
     {
-        linux_hidraw::imp::grant_linux_hidraw_access(install_persistent_rule)
+        linux_hidraw::imp::grant_linux_hidraw_access(
+            install_persistent_rule,
+            allow_terminal_fallback,
+        )
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = install_persistent_rule;
+        let _ = (install_persistent_rule, allow_terminal_fallback);
         Ok(String::new())
     }
 }

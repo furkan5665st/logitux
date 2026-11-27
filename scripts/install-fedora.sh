@@ -15,6 +15,7 @@ sudo rm -f /etc/udev/rules.d/99-logitux.rules
 sudo install -m 644 udev/60-logitux.rules /etc/udev/rules.d/60-logitux.rules
 sudo udevadm control --reload-rules
 sudo udevadm trigger --subsystem-match=hidraw --action=change
+sudo udevadm trigger --subsystem-match=misc --sysname-match=uinput --action=change || true
 
 cargo build --release --workspace
 

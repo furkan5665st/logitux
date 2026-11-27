@@ -12,12 +12,13 @@ use logitux_hidpp::{
     },
     FeatureId,
 };
-use logitux_transport::BlockedHidDevice;
+use logitux_transport::{build_manual_access_command, BlockedHidDevice};
 
 use crate::{
     canvas::{self, FullDpiEvent},
     hw_worker::{
-        compute_8110_button_map, DeviceUiSnapshot, HardwareWorkerHandle, HwCommand, HwEvent,
+        compact_dpi_stages, compute_8110_button_map, DeviceUiSnapshot, HardwareWorkerHandle,
+        HwCommand, HwEvent,
     },
     i18n::Lang,
     icons::{self, GhubIcon},
@@ -129,6 +130,7 @@ pub struct LogiTuxApp {
 
     discord_detected: Arc<AtomicBool>,
     obs_detected: Arc<AtomicBool>,
+    auto_switch_enabled: Arc<AtomicBool>,
     fg_exe: Arc<Mutex<Option<String>>>,
     discord_config_open: bool,
     recording_discord_shortcut: Option<u8>,
@@ -178,18 +180,22 @@ impl LogiTuxApp {
 
         let discord_detected = Arc::new(AtomicBool::new(false));
         let obs_detected = Arc::new(AtomicBool::new(false));
+        let auto_switch_enabled = Arc::new(AtomicBool::new(store.auto_profile_switching));
         let fg_exe = Arc::new(Mutex::new(None));
 
         {
             let disc_flag = discord_detected.clone();
             let obs_flag = obs_detected.clone();
+            let auto_flag = auto_switch_enabled.clone();
             let fg_slot = fg_exe.clone();
             let obs_cfg = store.obs.clone();
             std::thread::spawn(move || loop {
                 disc_flag.store(integrations::is_discord_detected(), Ordering::Relaxed);
                 obs_flag.store(integrations::is_obs_detected(&obs_cfg), Ordering::Relaxed);
-                if let Ok(mut g) = fg_slot.lock() {
-                    *g = input_synth::active_foreground_exe();
+                if auto_flag.load(Ordering::Relaxed) {
+                    if let Ok(mut g) = fg_slot.lock() {
+                        *g = input_synth::active_foreground_exe();
+                    }
                 }
                 std::thread::sleep(Duration::from_millis(2500));
             });
@@ -231,6 +237,7 @@ impl LogiTuxApp {
             custom_key_super: false,
             discord_detected,
             obs_detected,
+            auto_switch_enabled,
             fg_exe,
             discord_config_open: false,
             recording_discord_shortcut: None,
@@ -933,6 +940,7 @@ impl eframe::App for LogiTuxApp {
                             self.linux_perm_busy = true;
                             self.hw.send(HwCommand::GrantLinuxAccess {
                                 persistent_rule: self.linux_install_persistent_rule,
+                                allow_terminal_fallback: false,
                             });
                         }
                     } else {
@@ -999,6 +1007,8 @@ impl eframe::App for LogiTuxApp {
             }
         }
 
+        self.auto_switch_enabled
+            .store(self.store.auto_profile_switching, Ordering::Relaxed);
         if self.store.auto_profile_switching {
             let fg_opt = self.fg_exe.lock().ok().and_then(|g| g.clone());
             if let Some(fg) = fg_opt {
@@ -1125,10 +1135,10 @@ impl eframe::App for LogiTuxApp {
         self.macro_runtime.stop_all();
         if self.pending_onboard_commit.is_some() && !self.devices.is_empty() {
             self.commit_onboard_now(false);
-            std::thread::sleep(Duration::from_millis(280));
         }
-        self.hw.send(HwCommand::Shutdown);
-        std::thread::sleep(Duration::from_millis(50));
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        self.hw.send(HwCommand::Shutdown(Some(ack_tx)));
+        let _ = ack_rx.recv_timeout(Duration::from_millis(1500));
     }
 }
 
@@ -1571,6 +1581,7 @@ impl LogiTuxApp {
                         self.linux_perm_busy = true;
                         self.hw.send(HwCommand::GrantLinuxAccess {
                             persistent_rule: self.linux_install_persistent_rule,
+                            allow_terminal_fallback: true,
                         });
                     }
                     ui.add_space(10.0);
@@ -1586,6 +1597,32 @@ impl LogiTuxApp {
                         .clicked()
                     {
                         self.scan_devices();
+                    }
+                    ui.add_space(14.0);
+                    let manual_cmd =
+                        build_manual_access_command(self.linux_install_persistent_rule);
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(lang.pick(
+                                    "Polkit yoksa terminal komutunu kopyala",
+                                    "No polkit agent? Copy terminal command",
+                                ))
+                                .size(11.5)
+                                .color(theme::TEXT_MUTED),
+                            )
+                            .frame(false),
+                        )
+                        .clicked()
+                    {
+                        ctx.copy_text(manual_cmd);
+                        self.notify(
+                            lang.pick(
+                                "Komut panoya kopyalandı. Terminalde yapıştırıp çalıştırın, ardından Yeniden Tara'ya basın.",
+                                "Command copied to clipboard. Run it in a terminal, then click Rescan.",
+                            ),
+                            false,
+                        );
                     }
                 } else {
                     ui.add_space(140.0);
@@ -2162,15 +2199,14 @@ impl LogiTuxApp {
                 FullDpiEvent::DeleteStage(idx) => {
                     let p = self.store.active_profile_mut();
                     p.dpi_stages[idx] = 0;
-                    if let Some(first) = p.dpi_stages.iter().position(|&d| d > 0) {
-                        p.active_dpi_idx = first;
-                        if p.shift_dpi_idx == idx {
-                            p.shift_dpi_idx = first;
-                        }
-                        let d = p.dpi_stages[first];
-                        self.store.save();
-                        self.apply_live_dpi(d);
-                    }
+                    let (compacted, new_act, new_sh) =
+                        compact_dpi_stages(p.dpi_stages, p.active_dpi_idx, p.shift_dpi_idx);
+                    p.dpi_stages = compacted;
+                    p.active_dpi_idx = new_act;
+                    p.shift_dpi_idx = new_sh;
+                    let d = p.dpi_stages[new_act];
+                    self.store.save();
+                    self.apply_live_dpi(d);
                 }
                 FullDpiEvent::AddStage(dpi) => {
                     let p = self.store.active_profile_mut();
@@ -3720,7 +3756,7 @@ impl LogiTuxApp {
         }
 
         if self.about_open {
-            egui::Window::new("LogiTux v0.4.0")
+            egui::Window::new("LogiTux v0.4.1")
                 .collapsible(false)
                 .resizable(false)
                 .open(&mut self.about_open)

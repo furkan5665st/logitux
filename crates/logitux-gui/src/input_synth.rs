@@ -505,10 +505,10 @@ mod imp {
     const REL_WHEEL: u16 = 0x08;
     const REL_HWHEEL: u16 = 0x06;
 
-    const UI_SET_EVBIT: libc::c_ulong = 0x40045564;
-    const UI_SET_KEYBIT: libc::c_ulong = 0x40045565;
-    const UI_SET_RELBIT: libc::c_ulong = 0x40045566;
-    const UI_DEV_CREATE: libc::c_ulong = 0x5501;
+    const UI_SET_EVBIT: u32 = 0x40045564;
+    const UI_SET_KEYBIT: u32 = 0x40045565;
+    const UI_SET_RELBIT: u32 = 0x40045566;
+    const UI_DEV_CREATE: u32 = 0x5501;
 
     #[repr(C)]
     struct UinputUserDev {
@@ -533,21 +533,26 @@ mod imp {
         value: i32,
     }
 
-    static UINPUT_DEV: OnceLock<Mutex<Option<File>>> = OnceLock::new();
+    struct UinputSlot {
+        file: Option<File>,
+        last_attempt: Option<std::time::Instant>,
+    }
+
+    static UINPUT_DEV: OnceLock<Mutex<UinputSlot>> = OnceLock::new();
 
     fn init_uinput() -> Option<File> {
         let mut f = OpenOptions::new().write(true).open("/dev/uinput").ok()?;
         let fd = f.as_raw_fd();
         unsafe {
-            libc::ioctl(fd, UI_SET_EVBIT, EV_KEY as libc::c_int);
-            libc::ioctl(fd, UI_SET_EVBIT, EV_REL as libc::c_int);
-            libc::ioctl(fd, UI_SET_RELBIT, REL_WHEEL as libc::c_int);
-            libc::ioctl(fd, UI_SET_RELBIT, REL_HWHEEL as libc::c_int);
+            libc::ioctl(fd, UI_SET_EVBIT as _, EV_KEY as libc::c_int);
+            libc::ioctl(fd, UI_SET_EVBIT as _, EV_REL as libc::c_int);
+            libc::ioctl(fd, UI_SET_RELBIT as _, REL_WHEEL as libc::c_int);
+            libc::ioctl(fd, UI_SET_RELBIT as _, REL_HWHEEL as libc::c_int);
             for code in 1..=248 {
-                libc::ioctl(fd, UI_SET_KEYBIT, code as libc::c_int);
+                libc::ioctl(fd, UI_SET_KEYBIT as _, code as libc::c_int);
             }
             for btn in 0x110..=0x116 {
-                libc::ioctl(fd, UI_SET_KEYBIT, btn as libc::c_int);
+                libc::ioctl(fd, UI_SET_KEYBIT as _, btn as libc::c_int);
             }
         }
         let mut udev = UinputUserDev {
@@ -572,7 +577,7 @@ mod imp {
         };
         f.write_all(bytes).ok()?;
         unsafe {
-            if libc::ioctl(fd, UI_DEV_CREATE) < 0 {
+            if libc::ioctl(fd, UI_DEV_CREATE as _) < 0 {
                 return None;
             }
         }
@@ -581,11 +586,25 @@ mod imp {
     }
 
     fn emit_uinput(ev_type: u16, code: u16, value: i32) -> bool {
-        let mtx = UINPUT_DEV.get_or_init(|| Mutex::new(init_uinput()));
+        let mtx = UINPUT_DEV.get_or_init(|| {
+            Mutex::new(UinputSlot {
+                file: None,
+                last_attempt: None,
+            })
+        });
         let Ok(mut guard) = mtx.lock() else {
             return false;
         };
-        let Some(f) = guard.as_mut() else {
+        if guard.file.is_none() {
+            let should_try = guard
+                .last_attempt
+                .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(3));
+            if should_try {
+                guard.last_attempt = Some(std::time::Instant::now());
+                guard.file = init_uinput();
+            }
+        }
+        let Some(f) = guard.file.as_mut() else {
             return false;
         };
         let events = [
@@ -607,7 +626,11 @@ mod imp {
         let raw = unsafe {
             std::slice::from_raw_parts(events.as_ptr() as *const u8, std::mem::size_of_val(&events))
         };
-        f.write_all(raw).is_ok()
+        if f.write_all(raw).is_err() {
+            guard.file = None;
+            return false;
+        }
+        true
     }
 
     fn hid_to_evdev(hid: u8) -> Option<u16> {
@@ -647,13 +670,22 @@ mod imp {
             0x2C => 57,
             0x2D => 12,
             0x2E => 13,
+            0x2F => 26,
+            0x30 => 27,
+            0x31 => 43,
+            0x33 => 39,
+            0x34 => 40,
+            0x35 => 41,
             0x36 => 51,
             0x37 => 52,
+            0x38 => 53,
             0x39 => 58,
             0x3A..=0x43 => 59 + (hid - 0x3A) as u16,
             0x44 => 87,
             0x45 => 88,
             0x46 => 99,
+            0x47 => 70,
+            0x48 => 119,
             0x49 => 110,
             0x4A => 102,
             0x4B => 104,
@@ -664,6 +696,22 @@ mod imp {
             0x50 => 105,
             0x51 => 108,
             0x52 => 103,
+            0x54 => 98,
+            0x55 => 55,
+            0x56 => 74,
+            0x57 => 78,
+            0x58 => 96,
+            0x59 => 79,
+            0x5A => 80,
+            0x5B => 81,
+            0x5C => 75,
+            0x5D => 76,
+            0x5E => 77,
+            0x5F => 71,
+            0x60 => 72,
+            0x61 => 73,
+            0x62 => 82,
+            0x68..=0x73 => 183 + (hid - 0x68) as u16,
             _ => return None,
         })
     }
@@ -760,12 +808,38 @@ mod imp {
             return;
         }
         for ch in text.chars() {
-            let upper = ch.to_ascii_uppercase();
-            if upper.is_ascii_alphabetic() {
-                let mods = if ch.is_ascii_uppercase() { 0x02 } else { 0x00 };
-                tap_shortcut(mods, 0x04 + (upper as u8 - b'A'));
-            } else if ch == ' ' {
-                tap_shortcut(0, 0x2C);
+            if let Some((mods, hid)) = match ch {
+                'a'..='z' => Some((0x00, 0x04 + (ch as u8 - b'a'))),
+                'A'..='Z' => Some((0x02, 0x04 + (ch as u8 - b'A'))),
+                '1'..='9' => Some((0x00, 0x1E + (ch as u8 - b'1'))),
+                '0' => Some((0x00, 0x27)),
+                '\n' => Some((0x00, 0x28)),
+                '\t' => Some((0x00, 0x2B)),
+                ' ' => Some((0x00, 0x2C)),
+                '-' => Some((0x00, 0x2D)),
+                '_' => Some((0x02, 0x2D)),
+                '=' => Some((0x00, 0x2E)),
+                '+' => Some((0x02, 0x2E)),
+                '[' => Some((0x00, 0x2F)),
+                '{' => Some((0x02, 0x2F)),
+                ']' => Some((0x00, 0x30)),
+                '}' => Some((0x02, 0x30)),
+                '\\' => Some((0x00, 0x31)),
+                '|' => Some((0x02, 0x31)),
+                ';' => Some((0x00, 0x33)),
+                ':' => Some((0x02, 0x33)),
+                '\'' => Some((0x00, 0x34)),
+                '"' => Some((0x02, 0x34)),
+                ',' => Some((0x00, 0x36)),
+                '.' => Some((0x00, 0x37)),
+                '/' => Some((0x00, 0x38)),
+                '!' => Some((0x02, 0x1E)),
+                '@' => Some((0x02, 0x1F)),
+                '#' => Some((0x02, 0x20)),
+                '?' => Some((0x02, 0x38)),
+                _ => None,
+            } {
+                tap_shortcut(mods, hid);
             }
         }
     }
@@ -812,19 +886,90 @@ mod imp {
         let _ = emit_uinput(EV_KEY, key_code, 0);
     }
 
-    pub fn active_foreground_exe() -> Option<String> {
-        if let Ok(out) = Command::new("xdotool")
-            .args(["getactivewindow", "getwindowpid"])
-            .output()
-        {
-            if out.status.success() {
-                let pid = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
-                    return Some(comm.trim().to_lowercase());
-                }
-            }
+    #[derive(Clone, Copy)]
+    enum FgBackend {
+        Hyprland,
+        Sway,
+        Xdotool,
+        None,
+    }
+
+    static FG_BACKEND: OnceLock<FgBackend> = OnceLock::new();
+
+    fn detect_fg_backend() -> FgBackend {
+        let has = |cmd: &str| {
+            Command::new("sh")
+                .args(["-c", &format!("command -v {cmd} >/dev/null 2>&1")])
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() && has("hyprctl") {
+            return FgBackend::Hyprland;
         }
-        None
+        if std::env::var_os("SWAYSOCK").is_some() && has("swaymsg") {
+            return FgBackend::Sway;
+        }
+        if std::env::var_os("DISPLAY").is_some() && has("xdotool") {
+            return FgBackend::Xdotool;
+        }
+        FgBackend::None
+    }
+
+    pub fn active_foreground_exe() -> Option<String> {
+        match *FG_BACKEND.get_or_init(detect_fg_backend) {
+            FgBackend::Hyprland => {
+                let out = Command::new("hyprctl")
+                    .args(["activewindow", "-j"])
+                    .output()
+                    .ok()?;
+                if !out.status.success() {
+                    return None;
+                }
+                let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+                v.get("class")
+                    .and_then(|c| c.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_lowercase())
+            }
+            FgBackend::Sway => {
+                let out = Command::new("swaymsg")
+                    .args(["-t", "get_tree"])
+                    .output()
+                    .ok()?;
+                if !out.status.success() {
+                    return None;
+                }
+                let txt = String::from_utf8_lossy(&out.stdout);
+                let idx = txt.find("\"focused\": true")?;
+                let slice = &txt[idx.saturating_sub(260)..(idx + 260).min(txt.len())];
+                for key in ["\"app_id\": \"", "\"class\": \""] {
+                    if let Some(pos) = slice.find(key) {
+                        let rest = &slice[pos + key.len()..];
+                        if let Some(end) = rest.find('"') {
+                            let name = &rest[..end];
+                            if !name.is_empty() {
+                                return Some(name.to_lowercase());
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            FgBackend::Xdotool => {
+                let out = Command::new("xdotool")
+                    .args(["getactivewindow", "getwindowpid"])
+                    .output()
+                    .ok()?;
+                if out.status.success() {
+                    let pid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+                        return Some(comm.trim().to_lowercase());
+                    }
+                }
+                None
+            }
+            FgBackend::None => None,
+        }
     }
 }
 

@@ -70,6 +70,81 @@ pub fn apply_ghub_theme(ctx: &egui::Context) {
     style.spacing.slider_width = 195.0;
     style.spacing.slider_rail_height = 2.0;
     ctx.set_style(style);
+
+    install_system_fallback_fonts(ctx);
+}
+
+fn install_system_fallback_fonts(ctx: &egui::Context) {
+    #[cfg(target_os = "linux")]
+    const CANDIDATES: &[(&str, &[&str])] = &[
+        (
+            "sys-sans",
+            &[
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                "/usr/share/fonts/TTF/DejaVuSans.ttf",
+                "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+                "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+                "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+                "/usr/share/fonts/google-noto/NotoSans-Regular.ttf",
+                "/usr/share/fonts/liberation-sans/LiberationSans-Regular.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            ],
+        ),
+        (
+            "sys-sym",
+            &[
+                "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf",
+                "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
+                "/usr/share/fonts/google-noto/NotoSansSymbols2-Regular.ttf",
+                "/usr/share/fonts/truetype/noto/NotoSansSymbols-Regular.ttf",
+                "/usr/share/fonts/noto/NotoSansSymbols-Regular.ttf",
+            ],
+        ),
+        (
+            "sys-cjk",
+            &[
+                "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+                "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+                "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+                "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+            ],
+        ),
+    ];
+
+    #[cfg(target_os = "windows")]
+    const CANDIDATES: &[(&str, &[&str])] = &[
+        ("sys-sans", &[r"C:\Windows\Fonts\segoeui.ttf"]),
+        ("sys-sym", &[r"C:\Windows\Fonts\seguisym.ttf"]),
+    ];
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    const CANDIDATES: &[(&str, &[&str])] = &[];
+
+    let mut defs = egui::FontDefinitions::default();
+    let mut added = false;
+
+    for (name, paths) in CANDIDATES {
+        for path in *paths {
+            if let Ok(bytes) = std::fs::read(path) {
+                defs.font_data.insert(
+                    (*name).to_string(),
+                    std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+                );
+                if let Some(fam) = defs.families.get_mut(&egui::FontFamily::Proportional) {
+                    fam.push((*name).to_string());
+                }
+                if let Some(fam) = defs.families.get_mut(&egui::FontFamily::Monospace) {
+                    fam.push((*name).to_string());
+                }
+                added = true;
+                break;
+            }
+        }
+    }
+
+    if added {
+        ctx.set_fonts(defs);
+    }
 }
 
 pub fn floating_drawer_frame() -> egui::Frame {

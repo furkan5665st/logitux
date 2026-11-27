@@ -32,6 +32,34 @@ pub struct DeviceUiSnapshot {
     pub startup_effect: bool,
 }
 
+pub fn compact_dpi_stages(
+    stages: [u16; 5],
+    active_idx: usize,
+    shift_idx: usize,
+) -> ([u16; 5], usize, usize) {
+    let mut out = [0u16; 5];
+    let mut new_active = 0usize;
+    let mut new_shift = 0usize;
+    let mut write_pos = 0usize;
+    for (old_idx, &dpi) in stages.iter().enumerate() {
+        if dpi > 0 {
+            if old_idx == active_idx {
+                new_active = write_pos;
+            }
+            if old_idx == shift_idx {
+                new_shift = write_pos;
+            }
+            out[write_pos] = dpi;
+            write_pos += 1;
+        }
+    }
+    if write_pos == 0 {
+        out[0] = 800;
+        return (out, 0, 0);
+    }
+    (out, new_active.min(write_pos - 1), new_shift.min(write_pos - 1))
+}
+
 pub fn compute_8110_button_map(prof: &ProfileConfig, gshift_active: bool) -> [u8; 16] {
     let mut map = [0u8; 16];
     let layer = if gshift_active {
@@ -63,6 +91,7 @@ pub enum HwCommand {
     ScanDevices,
     GrantLinuxAccess {
         persistent_rule: bool,
+        allow_terminal_fallback: bool,
     },
     SelectDevice(usize),
     SetDpi(u16),
@@ -92,7 +121,7 @@ pub enum HwCommand {
         activate_onboard: bool,
         notify_toast: bool,
     },
-    Shutdown,
+    Shutdown(Option<Sender<()>>),
 }
 
 pub enum HwEvent {
@@ -168,6 +197,7 @@ fn run_worker_loop(
         &mut onboard_mode,
         &mut spy_enabled,
         &current_button_map,
+        true,
         &evt_tx,
         &ctx,
     );
@@ -182,6 +212,9 @@ fn run_worker_loop(
             let signature = presence_signature();
             if signature != last_presence {
                 last_presence = signature;
+                if cfg!(target_os = "linux") {
+                    thread::sleep(Duration::from_millis(250));
+                }
                 rescan_requested = true;
             }
         }
@@ -233,10 +266,12 @@ fn run_worker_loop(
         }
 
         let mut should_exit = false;
+        let mut shutdown_ack: Option<Sender<()>> = None;
         for cmd in coalesced {
             match cmd {
-                HwCommand::Shutdown => {
+                HwCommand::Shutdown(ack) => {
                     cleanup_all_devices(&devices);
+                    shutdown_ack = ack;
                     should_exit = true;
                     break;
                 }
@@ -247,23 +282,28 @@ fn run_worker_loop(
                         &mut onboard_mode,
                         &mut spy_enabled,
                         &current_button_map,
+                        false,
                         &evt_tx,
                         &ctx,
                     );
                     last_presence = presence_signature();
                 }
-                HwCommand::GrantLinuxAccess { persistent_rule } => {
-                    let res = grant_linux_hidraw_access(persistent_rule);
+                HwCommand::GrantLinuxAccess {
+                    persistent_rule,
+                    allow_terminal_fallback,
+                } => {
+                    let res = grant_linux_hidraw_access(persistent_rule, allow_terminal_fallback);
                     match res {
                         Ok(msg) => {
                             let _ = evt_tx.send(HwEvent::LinuxAccessFinished { ok: true, msg });
-                            thread::sleep(Duration::from_millis(250));
+                            thread::sleep(Duration::from_millis(300));
                             scan_into(
                                 &mut devices,
                                 &mut selected_idx,
                                 &mut onboard_mode,
                                 &mut spy_enabled,
                                 &current_button_map,
+                                true,
                                 &evt_tx,
                                 &ctx,
                             );
@@ -316,12 +356,18 @@ fn run_worker_loop(
                         if let Err(e) = m.connected.device.set_dpi(0, dpi) {
                             if is_connection_error(&e) {
                                 rescan_requested = true;
+                                let _ = evt_tx.send(HwEvent::Toast {
+                                    msg: format!("DPI hatası: {e}"),
+                                    is_err: true,
+                                });
+                                ctx.request_repaint();
+                            } else if onboard_mode != OnboardMode::Onboard {
+                                let _ = evt_tx.send(HwEvent::Toast {
+                                    msg: format!("DPI hatası: {e}"),
+                                    is_err: true,
+                                });
+                                ctx.request_repaint();
                             }
-                            let _ = evt_tx.send(HwEvent::Toast {
-                                msg: format!("DPI hatası: {e}"),
-                                is_err: true,
-                            });
-                            ctx.request_repaint();
                         }
                     }
                 }
@@ -508,6 +554,9 @@ fn run_worker_loop(
         }
 
         if should_exit {
+            if let Some(ack) = shutdown_ack {
+                let _ = ack.send(());
+            }
             break;
         }
 
@@ -519,6 +568,7 @@ fn run_worker_loop(
                 &mut onboard_mode,
                 &mut spy_enabled,
                 &current_button_map,
+                true,
                 &evt_tx,
                 &ctx,
             );
@@ -589,15 +639,28 @@ fn scan_into(
     onboard_mode: &mut OnboardMode,
     spy_enabled: &mut bool,
     current_button_map: &[u8; 16],
+    retry_on_udev_race: bool,
     evt_tx: &Sender<HwEvent>,
     ctx: &egui::Context,
 ) {
     devices.clear();
     *spy_enabled = false;
+    let mut report = connect_all_devices_diagnosed().ok();
+    if retry_on_udev_race && cfg!(target_os = "linux") {
+        if let Some(r) = &report {
+            if r.devices.is_empty() && !r.permission_denied.is_empty() {
+                thread::sleep(Duration::from_millis(450));
+                if let Ok(retried) = connect_all_devices_diagnosed() {
+                    report = Some(retried);
+                }
+            }
+        }
+    }
+
     let mut blocked_linux = Vec::new();
-    if let Ok(report) = connect_all_devices_diagnosed() {
-        blocked_linux = report.permission_denied;
-        for connected in report.devices {
+    if let Some(rep) = report {
+        blocked_linux = rep.permission_denied;
+        for connected in rep.devices {
             let summary = connected.device.probe_summary();
             let active_sector = connected
                 .device
@@ -698,8 +761,14 @@ fn commit_onboard_impl(
         return false;
     };
 
+    let (compacted_dpis, active_idx, shift_idx) = compact_dpi_stages(
+        active_prof.dpi_stages,
+        active_prof.active_dpi_idx,
+        active_prof.shift_dpi_idx,
+    );
+
     if !m.connected.device.has_feature(FeatureId::ONBOARD_PROFILES) {
-        let target_dpi = active_prof.dpi_stages[active_prof.active_dpi_idx.min(4)].max(400);
+        let target_dpi = compacted_dpis[active_idx].max(400);
         let _ = m.connected.device.set_dpi(0, target_dpi);
         if active_prof.report_rate_hz > 0 {
             let _ = m.connected.device.set_report_rate(active_prof.report_rate_hz);
@@ -770,9 +839,9 @@ fn commit_onboard_impl(
         item.to_onboard_with_discord(discord)
     };
 
-    hw_prof.dpi_stages = active_prof.dpi_stages;
-    hw_prof.default_dpi_index = active_prof.active_dpi_idx.min(4) as u8;
-    hw_prof.shift_dpi_index = active_prof.shift_dpi_idx.min(4) as u8;
+    hw_prof.dpi_stages = compacted_dpis;
+    hw_prof.default_dpi_index = active_idx as u8;
+    hw_prof.shift_dpi_index = shift_idx as u8;
     if active_prof.report_rate_hz > 0 && active_prof.report_rate_hz <= 1000 {
         hw_prof.report_rate_ms = (1000 / active_prof.report_rate_hz).max(1) as u8;
     }
@@ -809,7 +878,12 @@ fn commit_onboard_impl(
     }
 
     for (sec_id, data) in macro_writes {
-        if let Err(e) = m.connected.device.write_onboard_raw_sector(sec_id, &data) {
+        let mut wr = m.connected.device.write_onboard_raw_sector(sec_id, &data);
+        if wr.is_err() {
+            let _ = m.connected.device.set_onboard_mode(OnboardMode::Host);
+            wr = m.connected.device.write_onboard_raw_sector(sec_id, &data);
+        }
+        if let Err(e) = wr {
             if is_connection_error(&e) {
                 *rescan_requested = true;
             }
@@ -824,8 +898,14 @@ fn commit_onboard_impl(
     }
 
     let sec = m.active_sector;
-    let active_dpi_idx = active_prof.active_dpi_idx.min(4) as u8;
-    match m.connected.device.write_onboard_sector(sec, &encoded) {
+    let active_dpi_idx = active_idx as u8;
+    let mut write_res = m.connected.device.write_onboard_sector(sec, &encoded);
+    if write_res.is_err() {
+        let _ = m.connected.device.set_onboard_mode(OnboardMode::Host);
+        write_res = m.connected.device.write_onboard_sector(sec, &encoded);
+    }
+
+    match write_res {
         Ok(_) => {
             m.connected.device.ensure_rgb_powered();
             if activate_onboard {
@@ -865,5 +945,22 @@ fn commit_onboard_impl(
             ctx.request_repaint();
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compact_dpi_stages_removes_zero_gaps() {
+        let (stages, act, sh) = compact_dpi_stages([400, 0, 1600, 3200, 0], 2, 3);
+        assert_eq!(stages, [400, 1600, 3200, 0, 0]);
+        assert_eq!(act, 1);
+        assert_eq!(sh, 2);
+
+        let (empty, a2, s2) = compact_dpi_stages([0, 0, 0, 0, 0], 0, 0);
+        assert_eq!(empty, [800, 0, 0, 0, 0]);
+        assert_eq!((a2, s2), (0, 0));
     }
 }

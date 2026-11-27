@@ -156,10 +156,22 @@ impl Lang {
 
     #[cfg(not(windows))]
     pub fn detect() -> Self {
-        for key in ["LC_ALL", "LC_MESSAGES", "LANG"] {
+        for key in ["LC_ALL", "LC_MESSAGES", "LANGUAGE", "LANG"] {
             if let Ok(value) = std::env::var(key) {
-                if !value.is_empty() {
-                    return Self::from_code(&value);
+                for entry in value.split(':') {
+                    let trimmed = entry.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let base = trimmed
+                        .split(['.', '@'])
+                        .next()
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    if base == "c" || base == "posix" {
+                        continue;
+                    }
+                    return Self::from_code(trimmed);
                 }
             }
         }

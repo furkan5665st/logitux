@@ -13,4 +13,11 @@ sudo install -Dm644 "$SCRIPT_DIR/logitux.png" /usr/share/icons/hicolor/256x256/a
 if command -v udevadm >/dev/null 2>&1; then
   sudo udevadm control --reload-rules
   sudo udevadm trigger --subsystem-match=hidraw --action=change || true
+  sudo udevadm trigger --subsystem-match=misc --sysname-match=uinput --action=change || true
+fi
+if command -v update-desktop-database >/dev/null 2>&1; then
+  sudo update-desktop-database /usr/share/applications || true
+fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+  sudo gtk-update-icon-cache -f -t /usr/share/icons/hicolor || true
 fi
